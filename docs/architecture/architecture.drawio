@@ -1,0 +1,365 @@
+<mxfile host="drawio-plugin" modified="2026-10-12T08:04:15.703Z" agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36" etag="UZw3_siyIx_PHEgB-bcs" version="22.1.22" type="embed" pages="2">
+  <diagram id="sheet1" name="Общая структура">
+    <mxGraphModel dx="2516" dy="1066" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1800" pageHeight="1120" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="s1_title" value="Mini ClickHouse — общая структура и внешние интерфейсы" style="text;html=1;strokeColor=none;fillColor=none;fontColor=#202428;fontFamily=Arial;fontSize=24;fontStyle=1;align=center;" parent="1" vertex="1">
+          <mxGeometry x="420" y="20" width="1000" height="38" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_sub" value="Клиент → HTTP-слой → обработчики I*Api → ядро" style="text;html=1;strokeColor=none;fillColor=none;fontColor=#5A6672;fontFamily=Arial;fontSize=14;align=center;" parent="1" vertex="1">
+          <mxGeometry x="420" y="58" width="1000" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_client" value="Клиент&#xa;CLI · приложение · curl" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#526575;strokeWidth=1.5;fontColor=#1F2937;fontFamily=Arial;fontSize=14;arcSize=8;" parent="1" vertex="1">
+          <mxGeometry x="760" y="110" width="320" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_note" value="тело запроса (INSERT):&lt;br&gt;CSV · TSV · JSONEachRow" style="shape=note;whiteSpace=wrap;html=1;boundedLbl=1;fillColor=#FFF8E1;strokeColor=#C9A227;fontColor=#5A4A00;fontFamily=Arial;fontSize=12;size=18;" parent="1" vertex="1">
+          <mxGeometry x="1200" y="90" width="120" height="115" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_g_http" value="Внешний HTTP-слой" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#AAB5BE;strokeWidth=7;fontColor=#334155;fontFamily=Arial;fontSize=15;fontStyle=1;verticalAlign=top;spacingTop=8;arcSize=0;" parent="1" vertex="1">
+          <mxGeometry x="300" y="230" width="1240" height="170" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_http" value="HTTP Server" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E5F1FA;strokeColor=#46779B;strokeWidth=1.5;fontColor=#18344A;fontFamily=Arial;fontSize=14;arcSize=8;" parent="1" vertex="1">
+          <mxGeometry x="470" y="300" width="260" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_router" value="Router&#xa;(маршрутизация по операции)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E5F1FA;strokeColor=#46779B;strokeWidth=1.5;fontColor=#18344A;fontFamily=Arial;fontSize=14;arcSize=8;" parent="1" vertex="1">
+          <mxGeometry x="870" y="300" width="260" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_g_api" value="Внутренние обработчики (I*Api)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#AAB5BE;strokeWidth=7;fontColor=#334155;fontFamily=Arial;fontSize=15;fontStyle=1;verticalAlign=top;spacingTop=8;arcSize=0;" parent="1" vertex="1">
+          <mxGeometry x="300" y="440" width="1240" height="240" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_queryApi" value="«interface»&#xa;IQueryApi&#xa;────────────&#xa;query(sql, format): QueryResult" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF4CC;strokeColor=#B79528;strokeWidth=1.5;fontColor=#302A18;fontFamily=Arial;fontSize=12;dashed=1;dashPattern=6 4;align=center;verticalAlign=middle;spacing=5;" parent="1" vertex="1">
+          <mxGeometry x="340" y="500" width="260" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_insertApi" value="«interface»&#xa;IInsertApi&#xa;────────────&#xa;insert(table, format, body): InsertResult" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF4CC;strokeColor=#B79528;strokeWidth=1.5;fontColor=#302A18;fontFamily=Arial;fontSize=12;dashed=1;dashPattern=6 4;align=center;verticalAlign=middle;spacing=5;" parent="1" vertex="1">
+          <mxGeometry x="630" y="500" width="260" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_metaApi" value="«interface»&#xa;IMetadataApi&#xa;────────────&#xa;tables(): TableInfo[]&#xa;describe(table): Schema" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF4CC;strokeColor=#B79528;strokeWidth=1.5;fontColor=#302A18;fontFamily=Arial;fontSize=12;dashed=1;dashPattern=6 4;align=center;verticalAlign=middle;spacing=5;" parent="1" vertex="1">
+          <mxGeometry x="920" y="500" width="260" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_adminApi" value="«interface»&#xa;IAdminApi&#xa;────────────&#xa;ping(): Status&#xa;help(): String" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF4CC;strokeColor=#B79528;strokeWidth=1.5;fontColor=#302A18;fontFamily=Arial;fontSize=12;dashed=1;dashPattern=6 4;align=center;verticalAlign=middle;spacing=5;" parent="1" vertex="1">
+          <mxGeometry x="1210" y="500" width="260" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_g_core" value="Ядро (CORE)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fad9d5;strokeColor=#ae4132;strokeWidth=7;fontFamily=Arial;fontSize=15;fontStyle=1;verticalAlign=top;spacingTop=8;arcSize=0;" parent="1" vertex="1">
+          <mxGeometry x="300" y="710" width="1240" height="380" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_parser" value="Parser&#xa;SQL → Statement (AST)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E5F1FA;strokeColor=#46779B;strokeWidth=1.5;fontColor=#18344A;fontFamily=Arial;fontSize=13;arcSize=8;" parent="1" vertex="1">
+          <mxGeometry x="320" y="800" width="240" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_planner" value="Planner&#xa;Statement → QueryPlan" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E5F1FA;strokeColor=#46779B;strokeWidth=1.5;fontColor=#18344A;fontFamily=Arial;fontSize=13;arcSize=8;" parent="1" vertex="1">
+          <mxGeometry x="645" y="800" width="240" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_storage" value="Storage&#xa;MergeTree / parts" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E5F1FA;strokeColor=#46779B;strokeWidth=1.5;fontColor=#18344A;fontFamily=Arial;fontSize=13;arcSize=8;" parent="1" vertex="1">
+          <mxGeometry x="1280" y="800" width="240" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_catalog" value="Catalog&#xa;схемы таблиц (metadata)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#526575;strokeWidth=1.5;fontColor=#1F2937;fontFamily=Arial;fontSize=13;arcSize=8;" parent="1" vertex="1">
+          <mxGeometry x="520" y="960" width="240" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_dist" value="Distributed&#xa;шардинг / репликация" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE8E6;strokeColor=#C97B73;strokeWidth=1.4;fontColor=#7B2C26;fontFamily=Arial;fontSize=13;arcSize=8;dashed=1;" parent="1" vertex="1">
+          <mxGeometry x="970" y="960" width="240" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_cluster" value="Cluster nodes" style="shape=cube;whiteSpace=wrap;html=1;boundedLbl=1;fillColor=#FCE8E6;strokeColor=#C97B73;fontColor=#7B2C26;fontFamily=Arial;fontSize=12;" parent="1" vertex="1">
+          <mxGeometry x="1340" y="960" width="170" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_e1" value="запрос" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#3A4550;fontSize=11;" parent="1" source="s1_client" target="s1_http" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_e2" value="тело файла" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#8A98A5;strokeWidth=1.4;dashed=1;dashPattern=5 4;endArrow=open;endFill=0;fontColor=#6B7783;fontSize=11;" parent="1" source="s1_note" target="s1_client" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_e3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;" parent="1" source="s1_http" target="s1_router" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_e4" value="query" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#3A4550;fontSize=11;" parent="1" source="s1_router" target="s1_queryApi" edge="1">
+          <mxGeometry x="0.9091" relative="1" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="1000" y="420" />
+              <mxPoint x="470" y="420" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="s1_e5" value="insert" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#3A4550;fontSize=11;" parent="1" source="s1_router" target="s1_insertApi" edge="1">
+          <mxGeometry x="0.8378" relative="1" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="1000" y="420" />
+              <mxPoint x="760" y="420" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="s1_e6" value="meta" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#3A4550;fontSize=11;" parent="1" source="s1_router" target="s1_metaApi" edge="1">
+          <mxGeometry x="0.7273" relative="1" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="1000" y="420" />
+              <mxPoint x="1090" y="420" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="s1_e7" value="admin" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#3A4550;fontSize=11;" parent="1" source="s1_router" target="s1_adminApi" edge="1">
+          <mxGeometry x="0.8723" relative="1" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="1000" y="420" />
+              <mxPoint x="1340" y="420" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="s1_e8" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;" parent="1" source="s1_queryApi" target="s1_g_core" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_e9" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;" parent="1" source="s1_insertApi" target="s1_g_core" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_e10" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;" parent="1" source="s1_metaApi" target="s1_g_core" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_e11" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;" parent="1" source="s1_adminApi" target="s1_g_core" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_e12" value="Statement" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#3A4550;fontSize=11;" parent="1" source="s1_parser" target="s1_planner" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_e12b" value="QueryPlan" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#3A4550;fontSize=11;" parent="1" source="s1_planner" target="s1_executor" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_e13" value="scan / insert" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#3A4550;fontSize=11;exitX=1;exitY=0.5;exitDx=0;exitDy=0;" parent="1" source="s1_dist" target="s1_storage" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1260" y="1000" />
+              <mxPoint x="1260" y="840" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="s1_e14" value="get_table / schema" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#3A4550;fontSize=11;" parent="1" source="s1_executor" target="s1_catalog" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1040" y="920" />
+              <mxPoint x="640" y="920" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="s1_e15" value="route" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#3A4550;fontSize=11;" parent="1" source="s1_executor" target="s1_dist" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_e16" value="gRPC" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#3A4550;fontSize=11;" parent="1" source="s1_dist" target="s1_cluster" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_executor" value="Executor&#xa;план → BlockStream" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E5F1FA;strokeColor=#46779B;strokeWidth=1.5;fontColor=#18344A;fontFamily=Arial;fontSize=13;arcSize=8;" parent="1" vertex="1">
+          <mxGeometry x="970" y="800" width="240" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;" parent="1" source="s1_g_core" target="s1_g_core" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;" parent="1" source="s1_g_core" target="s1_g_core" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="sheet2" name="Устройство ядра">
+    <mxGraphModel dx="2516" dy="1066" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="2000" pageHeight="1450" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="s2_title" value="Mini ClickHouse — подсистемы ядра и внутренние интерфейсы" style="text;html=1;strokeColor=none;fillColor=none;fontColor=#202428;fontFamily=Arial;fontSize=24;fontStyle=1;align=center;" parent="1" vertex="1">
+          <mxGeometry x="500" y="20" width="1000" height="38" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_sub" value="Query subsystem в центре; сплошная стрелка — вызов, пунктир — использует типы" style="text;html=1;strokeColor=none;fillColor=none;fontColor=#5A6672;fontFamily=Arial;fontSize=14;align=center;" parent="1" vertex="1">
+          <mxGeometry x="500" y="60" width="1000" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_g_server" value="Транспорт (HTTP Server + Router)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#AAB5BE;strokeWidth=3;fontColor=#334155;fontFamily=Arial;fontSize=15;fontStyle=1;verticalAlign=top;spacingTop=8;arcSize=0;" parent="1" vertex="1">
+          <mxGeometry x="690" y="120" width="520" height="150" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_idbServer" value="«interface» IDbServer&lt;br&gt;run(addr)&lt;br&gt;маршрутизирует в IQueryApi · IInsertApi&lt;br&gt;IMetadataApi · IAdminApi" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF4CC;strokeColor=#B79528;strokeWidth=1.5;fontColor=#302A18;fontFamily=Arial;fontSize=12;dashed=1;dashPattern=6 4;align=center;verticalAlign=middle;spacing=5;" parent="1" vertex="1">
+          <mxGeometry x="730" y="165" width="440" height="85" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_g_query" value="Query subsystem" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9E6;strokeColor=#B79528;strokeWidth=7;fontColor=#5A4A00;fontFamily=Arial;fontSize=16;fontStyle=1;verticalAlign=top;spacingTop=8;arcSize=0;" parent="1" vertex="1">
+          <mxGeometry x="720" y="470" width="460" height="290" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_qParser" value="IQueryParser&#xa;parse(sql): Statement" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF4CC;strokeColor=#B79528;strokeWidth=1.4;fontColor=#302A18;fontFamily=Arial;fontSize=11;dashed=1;dashPattern=6 4;align=center;verticalAlign=middle;spacing=4;" parent="1" vertex="1">
+          <mxGeometry x="755" y="515" width="190" height="58" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_qPlanner" value="IPlanner&#xa;plan(Statement): QueryPlan" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF4CC;strokeColor=#B79528;strokeWidth=1.4;fontColor=#302A18;fontFamily=Arial;fontSize=11;dashed=1;dashPattern=6 4;align=center;verticalAlign=middle;spacing=4;" parent="1" vertex="1">
+          <mxGeometry x="955" y="515" width="190" height="58" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_qExec" value="IExecutor&#xa;execute(QueryPlan): IBlockStream" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF4CC;strokeColor=#B79528;strokeWidth=1.4;fontColor=#302A18;fontFamily=Arial;fontSize=11;dashed=1;dashPattern=6 4;align=center;verticalAlign=middle;spacing=4;" parent="1" vertex="1">
+          <mxGeometry x="755" y="585" width="190" height="58" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_qEngine" value="IQueryEngine (фасад)&lt;br&gt;parse → plan → execute" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF4CC;strokeColor=#B79528;strokeWidth=1.4;fontColor=#302A18;fontFamily=Arial;fontSize=11;dashed=1;dashPattern=6 4;align=center;verticalAlign=middle;spacing=4;" parent="1" vertex="1">
+          <mxGeometry x="955" y="585" width="190" height="58" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_qInput" value="IInputFormatParser&#xa;parse(format, body): Block" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF4CC;strokeColor=#B79528;strokeWidth=1.4;fontColor=#302A18;fontFamily=Arial;fontSize=11;dashed=1;dashPattern=6 4;align=center;verticalAlign=middle;spacing=4;" parent="1" vertex="1">
+          <mxGeometry x="755" y="655" width="190" height="58" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_qTransform" value="ITransform&#xa;execute(Block): Option&amp;lt;Block&amp;gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF4CC;strokeColor=#B79528;strokeWidth=1.4;fontColor=#302A18;fontFamily=Arial;fontSize=11;dashed=1;dashPattern=6 4;align=center;verticalAlign=middle;spacing=4;" parent="1" vertex="1">
+          <mxGeometry x="955" y="655" width="190" height="58" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_qNote" value="реализации: SqlParser, QueryPlanner, QueryExecutor" style="text;html=1;strokeColor=none;fillColor=none;fontColor=#8A7A2A;fontFamily=Arial;fontSize=11;align=center;" parent="1" vertex="1">
+          <mxGeometry x="760" y="718" width="390" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_g_catalog" value="Catalog subsystem" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#AAB5BE;strokeWidth=3;fontColor=#334155;fontFamily=Arial;fontSize=15;fontStyle=1;verticalAlign=top;spacingTop=8;arcSize=0;" parent="1" vertex="1">
+          <mxGeometry x="120" y="300" width="400" height="230" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_iCatalog" value="«interface» ICatalog&#xa;create/drop/get/list_table&#xa;(схемы + хэндлы таблиц)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF4CC;strokeColor=#B79528;strokeWidth=1.4;fontColor=#302A18;fontFamily=Arial;fontSize=12;dashed=1;dashPattern=6 4;align=center;verticalAlign=middle;spacing=5;" parent="1" vertex="1">
+          <mxGeometry x="160" y="345" width="320" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_inMemCatalog" value="InMemoryCatalog&#xa;get_table → Arc&amp;lt;dyn ITable&amp;gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E5F1FA;strokeColor=#46779B;strokeWidth=1.4;fontColor=#18344A;fontFamily=Arial;fontSize=12;arcSize=8;" parent="1" vertex="1">
+          <mxGeometry x="180" y="450" width="280" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_g_dist" value="Distributed" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#C97B73;strokeWidth=3;fontColor=#7B2C26;fontFamily=Arial;fontSize=15;fontStyle=1;verticalAlign=top;spacingTop=8;arcSize=0;" parent="1" vertex="1">
+          <mxGeometry x="1440" y="440" width="440" height="260" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_iShard" value="«interface» IShardRouter&#xa;shard(key) / nodes(shard)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF4CC;strokeColor=#B79528;strokeWidth=1.4;fontColor=#302A18;fontFamily=Arial;fontSize=12;dashed=1;dashPattern=6 4;align=center;verticalAlign=middle;spacing=5;" parent="1" vertex="1">
+          <mxGeometry x="1480" y="490" width="360" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_iRepl" value="«interface» IReplicationService&#xa;appendPart / fetchPart / heartbeat" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF4CC;strokeColor=#B79528;strokeWidth=1.4;fontColor=#302A18;fontFamily=Arial;fontSize=12;dashed=1;dashPattern=6 4;align=center;verticalAlign=middle;spacing=5;" parent="1" vertex="1">
+          <mxGeometry x="1480" y="585" width="360" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_cluster" value="Cluster nodes&#xa;(shard · replica)" style="shape=cube;whiteSpace=wrap;html=1;boundedLbl=1;fillColor=#FAFAFA;strokeColor=#56616A;fontColor=#202428;fontFamily=Arial;fontSize=12;" parent="1" vertex="1">
+          <mxGeometry x="1570" y="770" width="180" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_g_types" value="Общие доменные типы (types)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#AAB5BE;strokeWidth=3;fontColor=#334155;fontFamily=Arial;fontSize=15;fontStyle=1;verticalAlign=top;spacingTop=8;arcSize=0;" parent="1" vertex="1">
+          <mxGeometry x="100" y="770" width="440" height="310" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_iBlockStream" value="«interface»&#xa;IBlockStream" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF4CC;strokeColor=#B79528;strokeWidth=1.4;fontColor=#302A18;fontFamily=Arial;fontSize=12;dashed=1;dashPattern=6 4;align=center;verticalAlign=middle;spacing=4;" parent="1" vertex="1">
+          <mxGeometry x="130" y="815" width="180" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_Block" value="Block / ColumnBlock&#xa;ColumnData" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F2F4F7;strokeColor=#8B98A5;strokeWidth=1.2;fontColor=#374151;fontFamily=Arial;fontSize=12;align=center;verticalAlign=middle;" parent="1" vertex="1">
+          <mxGeometry x="330" y="815" width="180" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_Meta" value="PartMeta · Mark&#xa;GranuleRange · PartId" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F2F4F7;strokeColor=#8B98A5;strokeWidth=1.2;fontColor=#374151;fontFamily=Arial;fontSize=12;align=center;verticalAlign=middle;" parent="1" vertex="1">
+          <mxGeometry x="130" y="900" width="180" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_Schema" value="TableSchema&#xa;TableDefinition" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F2F4F7;strokeColor=#8B98A5;strokeWidth=1.2;fontColor=#374151;fontFamily=Arial;fontSize=12;align=center;verticalAlign=middle;" parent="1" vertex="1">
+          <mxGeometry x="330" y="900" width="180" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_Expr" value="Expr · Statement&#xa;SelectQuery · QueryPlan" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F2F4F7;strokeColor=#8B98A5;strokeWidth=1.2;fontColor=#374151;fontFamily=Arial;fontSize=12;align=center;verticalAlign=middle;" parent="1" vertex="1">
+          <mxGeometry x="130" y="985" width="380" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_g_storage" value="Storage subsystem (MergeTree)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#AAB5BE;strokeWidth=3;fontColor=#334155;fontFamily=Arial;fontSize=15;fontStyle=1;verticalAlign=top;spacingTop=8;arcSize=0;" parent="1" vertex="1">
+          <mxGeometry x="660" y="1020" width="760" height="470" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_iTable" value="«interface» ITable&#xa;insert / scan / flush / optimize" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF4CC;strokeColor=#B79528;strokeWidth=1.4;fontColor=#302A18;fontFamily=Arial;fontSize=12;dashed=1;dashPattern=6 4;align=center;verticalAlign=middle;spacing=4;" parent="1" vertex="1">
+          <mxGeometry x="700" y="1080" width="180" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_iPartRepo" value="«interface»&#xa;IPartRepository" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF4CC;strokeColor=#B79528;strokeWidth=1.4;fontColor=#302A18;fontFamily=Arial;fontSize=12;dashed=1;dashPattern=6 4;align=center;verticalAlign=middle;spacing=4;" parent="1" vertex="1">
+          <mxGeometry x="980" y="1080" width="160" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_iDataPart" value="«interface»&#xa;IDataPart" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF4CC;strokeColor=#B79528;strokeWidth=1.4;fontColor=#302A18;fontFamily=Arial;fontSize=12;dashed=1;dashPattern=6 4;align=center;verticalAlign=middle;spacing=4;" parent="1" vertex="1">
+          <mxGeometry x="1240" y="1080" width="160" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_iPrune" value="IPartPruner&#xa;(min/max)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF4CC;strokeColor=#B79528;strokeWidth=1.4;fontColor=#302A18;fontFamily=Arial;fontSize=12;dashed=1;dashPattern=6 4;align=center;verticalAlign=middle;spacing=4;" parent="1" vertex="1">
+          <mxGeometry x="680" y="1268" width="220" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_iIndex" value="IPrimaryIndex&#xa;(sparse granules)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF4CC;strokeColor=#B79528;strokeWidth=1.4;fontColor=#302A18;fontFamily=Arial;fontSize=12;dashed=1;dashPattern=6 4;align=center;verticalAlign=middle;spacing=4;" parent="1" vertex="1">
+          <mxGeometry x="1180" y="1268" width="210" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_iMerge" value="IMergePolicy /&#xa;IPartMerger" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF4CC;strokeColor=#B79528;strokeWidth=1.4;fontColor=#302A18;fontFamily=Arial;fontSize=12;dashed=1;dashPattern=6 4;align=center;verticalAlign=middle;spacing=4;" parent="1" vertex="1">
+          <mxGeometry x="930" y="1268" width="210" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_iCodec" value="ICodec&#xa;(None / LZ4 / ZSTD)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF4CC;strokeColor=#B79528;strokeWidth=1.4;fontColor=#302A18;fontFamily=Arial;fontSize=12;dashed=1;dashPattern=6 4;align=center;verticalAlign=middle;spacing=4;" parent="1" vertex="1">
+          <mxGeometry x="680" y="1400" width="220" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_partFiles" value="Файлы part: part.json, primary.idx&lt;br&gt;колонки *.bin · marks *.mrk" style="shape=document;whiteSpace=wrap;html=1;boundedLbl=1;fillColor=#E8F5E9;strokeColor=#548B61;strokeWidth=1.4;fontColor=#1F4427;fontFamily=Arial;fontSize=12;align=center;verticalAlign=middle;" parent="1" vertex="1">
+          <mxGeometry x="1140" y="1400" width="260" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_e1" value="query / insert / meta" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#3A4550;fontSize=11;" parent="1" source="s2_idbServer" target="s2_g_query" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_e2" value="get_table / schema" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#3A4550;fontSize=11;" parent="1" source="s2_g_query" target="s2_iCatalog" edge="1">
+          <mxGeometry x="0.6296" relative="1" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="680" y="690" />
+              <mxPoint x="680" y="390" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="s2_e3" value="scan / insert" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#3A4550;fontSize=11;" parent="1" source="s2_g_query" target="s2_iTable" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_e4" value="route" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#3A4550;fontSize=11;" parent="1" source="s2_g_query" target="s2_iShard" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1240" y="530" />
+              <mxPoint x="1240" y="530" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="s2_e5" value="использует Block / GranuleRange / PartId" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#8A98A5;strokeWidth=1.4;dashed=1;dashPattern=5 4;endArrow=open;endFill=0;fontColor=#6B7783;fontSize=11;" parent="1" source="s2_g_query" target="s2_iBlockStream" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="170" y="690" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="s2_e6" value="Arc&amp;lt;dyn ITable&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#3A4550;fontSize=11;" parent="1" source="s2_iCatalog" target="s2_iTable" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="80" y="390" />
+              <mxPoint x="80" y="1110" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="s2_e7" value="parts" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#3A4550;fontSize=11;" parent="1" source="s2_iTable" target="s2_iPartRepo" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_e8" value="open / read" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#3A4550;fontSize=11;" parent="1" source="s2_iPartRepo" target="s2_iDataPart" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_e9" value="prune" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#3A4550;fontSize=11;" parent="1" source="s2_iTable" target="s2_iPrune" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_e10" value="granules" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#3A4550;fontSize=11;" parent="1" source="s2_iDataPart" target="s2_iIndex" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1305" y="1250" />
+              <mxPoint x="1305" y="1250" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="s2_e11" value="merge" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#3A4550;fontSize=11;" parent="1" source="s2_iTable" target="s2_iMerge" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="850" y="1200" />
+              <mxPoint x="1020" y="1200" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="s2_e12" value="codec" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#3A4550;fontSize=11;" parent="1" source="s2_iDataPart" target="s2_iCodec" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1410" y="1120" />
+              <mxPoint x="1410" y="1380" />
+              <mxPoint x="810" y="1380" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="s2_e13" value="column files" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#526575;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#3A4550;fontSize=11;" parent="1" source="s2_iCodec" target="s2_partFiles" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_e14" value="репликация PartId" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#C97B73;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#7B2C26;fontSize=11;" parent="1" source="s2_iRepl" target="s2_iDataPart" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_e15" value="gRPC" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#C97B73;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#7B2C26;fontSize=11;" parent="1" source="s2_iShard" target="s2_cluster" edge="1">
+          <mxGeometry x="0.7591" relative="1" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="1860.09" y="530.09" />
+              <mxPoint x="1860.09" y="815" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="s2_e16" value="manifest" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#8A98A5;strokeWidth=1.4;dashed=1;dashPattern=5 4;endArrow=open;endFill=0;fontColor=#6B7783;fontSize=11;" parent="1" source="s2_iTable" target="s2_Schema" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="740" y="935" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
