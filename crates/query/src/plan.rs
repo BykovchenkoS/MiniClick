@@ -11,6 +11,7 @@ pub(crate) struct QueryPlan {
 }
 
 pub(crate) struct ProjectionColumn {
-    pub source: String,
+    pub expr: types::Expr,
+    pub data_type: types::DataType,
     pub output: String,
 }

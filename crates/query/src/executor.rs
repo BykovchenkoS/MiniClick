@@ -1,5 +1,5 @@
 use crate::plan::{ProjectionColumn, QueryPlan};
-use types::{Block, BlockStream, Column, DbError, Expr, QueryOutput, Result};
+use types::{Block, BlockStream, Column, Expr, QueryOutput, Result};
 
 pub(crate) fn execute(plan: QueryPlan) -> Result<QueryOutput> {
     // Схема и WHERE уже проверены планировщиком, но scan для LIMIT 0 не нужен
@@ -73,15 +73,9 @@ impl SelectStream {
             .projection
             .iter()
             .map(|column| {
-                let data = block.column(&column.source).ok_or_else(|| {
-                    DbError::Internal(format!(
-                        "scan не вернул запрошенную колонку '{}'",
-                        column.source
-                    ))
-                })?;
                 Ok(Column {
                     name: column.output.clone(),
-                    data: data.clone(),
+                    data: crate::expr::project(&block, &column.expr, column.data_type)?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;

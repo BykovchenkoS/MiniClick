@@ -21,8 +21,6 @@ pub(crate) fn parse(sql: &str) -> Result<Command> {
         return Err(DbError::Syntax("пустой SQL-запрос".into()));
     }
     let statement = parser.parse_statement().map_err(syntax)?;
-    // В sqlparser 0.53 CREATE не включает SETTINGS: разбираем только этот
-    // хвост токенами библиотеки, не разделяем исходный SQL по строкам/пробелам.
     let settings = if matches!(statement, Statement::CreateTable(_))
         && parser.parse_keyword(Keyword::SETTINGS)
     {
@@ -246,9 +244,23 @@ fn translate(query: Query) -> Result<SelectQuery> {
                 name: id.value,
                 alias: Some(alias.value),
             }),
-            _ => Err(unsupported(
-                "выражение, агрегат или квалифицированная колонка в SELECT",
-            )),
+            SqlSelectItem::UnnamedExpr(expr) => {
+                let label = expr.to_string();
+                Ok(SelectItem::Expression {
+                    expr: translate_expr(expr)?,
+                    alias: None,
+                    label,
+                })
+            }
+            SqlSelectItem::ExprWithAlias { expr, alias } => {
+                let label = expr.to_string();
+                Ok(SelectItem::Expression {
+                    expr: translate_expr(expr)?,
+                    alias: Some(alias.value),
+                    label,
+                })
+            }
+            _ => Err(unsupported("квалифицированная звёздочка в SELECT")),
         })
         .collect::<Result<Vec<_>>>()?;
     if projection.is_empty() {
@@ -262,7 +274,7 @@ fn translate(query: Query) -> Result<SelectQuery> {
     })
 }
 
-// Переводим только поддерживаемые выражения; типы проверит планировщик.
+// Переводим только поддерживаемые выражения, типы проверит планировщик
 fn translate_expr(expr: Expr) -> Result<types::Expr> {
     use sqlparser::ast::{BinaryOperator as B, UnaryOperator as U, Value as V};
     use types::{BinaryOp as Op, Expr as E, UnaryOp};
@@ -281,7 +293,10 @@ fn translate_expr(expr: Expr) -> Result<types::Expr> {
                 Expr::Value(V::Number(text, _)) => {
                     Ok(E::Literal(parse_number(&format!("-{text}"))?))
                 }
-                _ => Err(unsupported("унарный минус вне числового литерала")),
+                expr => Ok(E::Unary {
+                    op: UnaryOp::Neg,
+                    expr: Box::new(translate_expr(expr)?),
+                }),
             }
         }
         Expr::UnaryOp { op: U::Plus, expr } => match *expr {
@@ -290,6 +305,10 @@ fn translate_expr(expr: Expr) -> Result<types::Expr> {
         },
         Expr::BinaryOp { left, op, right } => {
             let op = match op {
+                B::Plus => Op::Add,
+                B::Minus => Op::Sub,
+                B::Multiply => Op::Mul,
+                B::Divide => Op::Div,
                 B::Eq => Op::Eq,
                 B::NotEq => Op::NotEq,
                 B::Lt => Op::Lt,
@@ -298,11 +317,7 @@ fn translate_expr(expr: Expr) -> Result<types::Expr> {
                 B::GtEq => Op::GtEq,
                 B::And => Op::And,
                 B::Or => Op::Or,
-                _ => {
-                    return Err(unsupported(
-                        "оператор WHERE (арифметика будет добавлена отдельно)",
-                    ))
-                }
+                _ => return Err(unsupported("оператор выражения")),
             };
             Ok(E::binary(
                 op,
@@ -311,7 +326,7 @@ fn translate_expr(expr: Expr) -> Result<types::Expr> {
             ))
         }
         _ => Err(unsupported(
-            "выражение WHERE: NULL, IN, LIKE, функция или другая конструкция",
+            "выражение: NULL, IN, LIKE, функция или другая конструкция",
         )),
     }
 }
@@ -429,7 +444,6 @@ mod tests {
             "SELECT DISTINCT id FROM events",
             "SELECT id FROM events GROUP BY id",
             "SELECT count() FROM events",
-            "SELECT id + 1 FROM events",
             "SELECT 1",
             "SELECT * FROM events, other",
             "SELECT * FROM events JOIN other ON events.id = other.id",

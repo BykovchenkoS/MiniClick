@@ -7,10 +7,18 @@ pub(crate) struct SelectQuery {
     pub limit: Option<u64>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub(crate) enum SelectItem {
     Wildcard,
-    Column { name: String, alias: Option<String> },
+    Column {
+        name: String,
+        alias: Option<String>,
+    },
+    Expression {
+        expr: types::Expr,
+        alias: Option<String>,
+        label: String,
+    },
 }
 
 /// Внутренний результат перевода SQL. Не является общим интерфейсом проекта.

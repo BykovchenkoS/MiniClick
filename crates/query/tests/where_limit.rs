@@ -291,8 +291,6 @@ fn rejects_unimplemented_predicates_and_limit_variants() {
         "SELECT id FROM events WHERE id IN (1, 2)",
         "SELECT id FROM events WHERE event LIKE 'c%'",
         "SELECT id FROM events WHERE id IS NULL",
-        "SELECT id FROM events WHERE id + 1 = 2",
-        "SELECT id FROM events WHERE -id = 1",
         "SELECT id FROM events LIMIT 2 OFFSET 1",
         "SELECT id FROM events LIMIT 1 BY id",
     ] {
@@ -355,7 +353,7 @@ fn result_does_not_depend_on_block_boundaries() {
     }
 }
 
-// Таблица намеренно игнорирует predicate, проверяем точную фильтрацию в Query
+// Таблица намеренно игнорирует predicate: проверяем точную фильтрацию в Query.
 struct SpyTable {
     definition: TableDefinition,
     request: Mutex<Option<ScanRequest>>,

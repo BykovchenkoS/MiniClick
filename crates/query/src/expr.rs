@@ -1,7 +1,9 @@
-//! Проверка типов WHERE и вычисление маски строк
-//! Bool нужен только внутри Query, общий DataType не меняем
+//! Проверка типов выражений, арифметика, проекция и маска WHERE
+//! Bool нужен только внутри Query: общий DataType не меняем
 use std::cmp::Ordering;
-use types::{BinaryOp, Block, DataType, DbError, Expr, Result, TableSchema, UnaryOp, Value};
+use types::{
+    BinaryOp, Block, ColumnData, DataType, DbError, Expr, Result, TableSchema, UnaryOp, Value,
+};
 
 #[derive(Debug, PartialEq, Eq)]
 enum ExprType {
@@ -26,6 +28,32 @@ pub(crate) fn bind_predicate(mut expr: Expr, schema: &TableSchema) -> Result<Exp
     Ok(expr)
 }
 
+pub(crate) fn bind_scalar(mut expr: Expr, schema: &TableSchema) -> Result<(Expr, DataType)> {
+    match bind(&mut expr, schema)? {
+        ExprType::Scalar(t) => Ok((expr, t)),
+        ExprType::Bool => Err(mismatch(
+            "логическое выражение в SELECT пока не поддерживается: в общих типах нет Bool",
+        )),
+    }
+}
+
+fn arithmetic_type(op: BinaryOp, left: DataType, right: DataType) -> Result<DataType> {
+    if !numeric(left) || !numeric(right) {
+        return Err(mismatch(
+            "арифметика поддерживает только Int64, UInt64 и Float64",
+        ));
+    }
+    Ok(
+        if op == BinaryOp::Div || left == DataType::Float64 || right == DataType::Float64 {
+            DataType::Float64
+        } else if left == DataType::UInt64 && right == DataType::UInt64 {
+            DataType::UInt64
+        } else {
+            DataType::Int64
+        },
+    )
+}
+
 fn bind(expr: &mut Expr, schema: &TableSchema) -> Result<ExprType> {
     use BinaryOp::*;
     match expr {
@@ -34,6 +62,30 @@ fn bind(expr: &mut Expr, schema: &TableSchema) -> Result<ExprType> {
             .map(|c| ExprType::Scalar(c.data_type))
             .ok_or_else(|| DbError::UnknownColumn(name.clone())),
         Expr::Literal(value) => Ok(ExprType::Scalar(value.data_type())),
+        Expr::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } => match bind(expr, schema)? {
+            ExprType::Scalar(DataType::Float64) => Ok(ExprType::Scalar(DataType::Float64)),
+            ExprType::Scalar(DataType::Int64 | DataType::UInt64) => {
+                Ok(ExprType::Scalar(DataType::Int64))
+            }
+            _ => Err(mismatch("унарный минус ожидает число")),
+        },
+        Expr::Binary {
+            op: op @ (Add | Sub | Mul | Div),
+            left,
+            right,
+        } => {
+            let lt = bind(left, schema)?;
+            let rt = bind(right, schema)?;
+            match (lt, rt) {
+                (ExprType::Scalar(a), ExprType::Scalar(b)) => {
+                    Ok(ExprType::Scalar(arithmetic_type(*op, a, b)?))
+                }
+                _ => Err(mismatch("арифметика не принимает логические значения")),
+            }
+        }
         Expr::Unary {
             op: UnaryOp::Not,
             expr,
@@ -48,7 +100,7 @@ fn bind(expr: &mut Expr, schema: &TableSchema) -> Result<ExprType> {
             left,
             right,
         } => {
-            // Проверяем обе стороны до чтения, короткое замыкание не скрывает ошибки типов/имен
+            // Проверяем обе стороны до чтения, короткое замыкание не скрывает ошибки типов/имён
             let left_type = bind(left, schema)?;
             let right_type = bind(right, schema)?;
             if left_type != ExprType::Bool || right_type != ExprType::Bool {
@@ -63,14 +115,10 @@ fn bind(expr: &mut Expr, schema: &TableSchema) -> Result<ExprType> {
         } => {
             let mut lt = bind(left, schema)?;
             let mut rt = bind(right, schema)?;
-            if let (Expr::Column(_), Expr::Literal(value), ExprType::Scalar(target)) =
-                (&**left, &mut **right, &lt)
-            {
+            if let (Expr::Literal(value), ExprType::Scalar(target)) = (&mut **right, &lt) {
                 cast_literal(value, *target)?;
                 rt = ExprType::Scalar(value.data_type());
-            } else if let (Expr::Literal(value), Expr::Column(_), ExprType::Scalar(target)) =
-                (&mut **left, &**right, &rt)
-            {
+            } else if let (Expr::Literal(value), ExprType::Scalar(target)) = (&mut **left, &rt) {
                 cast_literal(value, *target)?;
                 lt = ExprType::Scalar(value.data_type());
             }
@@ -150,10 +198,120 @@ fn scalar(expr: &Expr, block: &Block, row: usize) -> Result<Value> {
         Expr::Column(name) => block
             .column(name)
             .map(|column| column.get(row))
-            .ok_or_else(|| DbError::Internal(format!("scan не вернул колонку WHERE '{name}'"))),
+            .ok_or_else(|| DbError::Internal(format!("scan не вернул колонку выражения '{name}'"))),
+        Expr::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } => negate(scalar(expr, block, row)?),
+        Expr::Binary {
+            op: op @ (BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div),
+            left,
+            right,
+        } => arithmetic(*op, scalar(left, block, row)?, scalar(right, block, row)?),
         _ => Err(DbError::Internal(
             "непроверенное скалярное выражение".into(),
         )),
+    }
+}
+
+/// Вычисление скалярной проекции. Для простой колонки сохраняем быстрый путь
+pub(crate) fn project(block: &Block, expr: &Expr, data_type: DataType) -> Result<ColumnData> {
+    if let Expr::Column(name) = expr {
+        return block
+            .column(name)
+            .cloned()
+            .ok_or_else(|| DbError::Internal(format!("scan не вернул колонку '{name}'")));
+    }
+    let mut result = ColumnData::empty(data_type);
+    for row in 0..block.rows() {
+        result.push(scalar(expr, block, row)?)?;
+    }
+    Ok(result)
+}
+
+fn negate(value: Value) -> Result<Value> {
+    match value {
+        Value::Int64(x) => x
+            .checked_neg()
+            .map(Value::Int64)
+            .ok_or_else(|| mismatch("переполнение Int64 при унарном минусе")),
+        Value::UInt64(x) => i64::try_from(-(x as i128))
+            .map(Value::Int64)
+            .map_err(|_| mismatch("результат унарного минуса не помещается в Int64")),
+        Value::Float64(x) if x.is_finite() => Ok(Value::Float64(-x)),
+        _ => Err(mismatch("унарный минус ожидает конечное число")),
+    }
+}
+
+fn as_float(value: &Value) -> Result<f64> {
+    match value.cast(DataType::Float64) {
+        Some(Value::Float64(x)) if x.is_finite() => Ok(x),
+        _ => Err(mismatch(
+            "арифметика Float64 требует конечного числа и точного приведения целого (до 2^53)",
+        )),
+    }
+}
+
+fn as_integer(value: &Value) -> Result<i128> {
+    match value {
+        Value::Int64(x) => Ok(*x as i128),
+        Value::UInt64(x) => Ok(*x as i128),
+        _ => Err(mismatch("ожидалось целое число")),
+    }
+}
+
+fn arithmetic(op: BinaryOp, left: Value, right: Value) -> Result<Value> {
+    use BinaryOp::*;
+    let target = arithmetic_type(op, left.data_type(), right.data_type())?;
+    let overflow = || mismatch("переполнение при вычислении арифметического выражения");
+    match target {
+        DataType::Float64 => {
+            let (a, b) = (as_float(&left)?, as_float(&right)?);
+            if op == Div && b == 0.0 {
+                return Err(mismatch("деление на ноль"));
+            }
+            let value = match op {
+                Add => a + b,
+                Sub => a - b,
+                Mul => a * b,
+                Div => a / b,
+                _ => {
+                    return Err(DbError::Internal(
+                        "неизвестная арифметическая операция".into(),
+                    ))
+                }
+            };
+            if !value.is_finite() {
+                return Err(overflow());
+            }
+            Ok(Value::Float64(value))
+        }
+        DataType::UInt64 => {
+            let (Value::UInt64(a), Value::UInt64(b)) = (left, right) else {
+                return Err(DbError::Internal("непроверенные типы UInt64".into()));
+            };
+            let value = match op {
+                Add => a.checked_add(b),
+                Sub => a.checked_sub(b),
+                Mul => a.checked_mul(b),
+                _ => None,
+            };
+            value.map(Value::UInt64).ok_or_else(overflow)
+        }
+        DataType::Int64 => {
+            let (a, b) = (as_integer(&left)?, as_integer(&right)?);
+            let value = match op {
+                Add => a.checked_add(b),
+                Sub => a.checked_sub(b),
+                Mul => a.checked_mul(b),
+                _ => None,
+            };
+            value
+                .and_then(|v| i64::try_from(v).ok())
+                .map(Value::Int64)
+                .ok_or_else(overflow)
+        }
+        _ => Err(DbError::Internal("непроверенный тип арифметики".into())),
     }
 }
 

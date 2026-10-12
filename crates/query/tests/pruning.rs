@@ -150,6 +150,8 @@ fn pruning_preserves_query_results_and_skips_unneeded_ranges() {
     let (full, _) = setup(false);
     let (pruned, table) = setup(true);
     for predicate in [
+        "id + 1 > 10",
+        "id * 2 >= 20 AND id < 21",
         "id >= 10",
         "10 <= id",
         "id = 11",

@@ -1,54 +1,57 @@
 use crate::ast::{SelectItem, SelectQuery};
 use crate::plan::{ProjectionColumn, QueryPlan};
 use std::collections::HashSet;
-use types::{Catalog, ColumnDef, DbError, Result, ScanRequest};
+use types::{Catalog, ColumnDef, DbError, Expr, Result, ScanRequest};
 
 pub(crate) fn plan(query: SelectQuery, catalog: &dyn Catalog) -> Result<QueryPlan> {
     let table = catalog.get_table(&query.table)?;
     let schema = &table.definition().schema;
-    let mut projection = Vec::new();
+    let mut expressions = Vec::new();
     for item in query.projection {
         match item {
             SelectItem::Wildcard => {
                 for column in &schema.columns {
-                    projection.push(ProjectionColumn {
-                        source: column.name.clone(),
-                        output: column.name.clone(),
-                    });
+                    expressions.push((Expr::col(&column.name), column.name.clone()));
                 }
             }
             SelectItem::Column { name, alias } => {
-                projection.push(ProjectionColumn {
-                    output: alias.unwrap_or_else(|| name.clone()),
-                    source: name,
-                });
+                let output = alias.unwrap_or_else(|| name.clone());
+                expressions.push((Expr::Column(name), output));
+            }
+            SelectItem::Expression { expr, alias, label } => {
+                expressions.push((expr, alias.unwrap_or(label)))
             }
         }
     }
     let mut output_names = HashSet::new();
     let mut columns = Vec::new();
     let mut header = Vec::new();
-    for column in &projection {
-        let definition = schema
-            .column(&column.source)
-            .ok_or_else(|| DbError::UnknownColumn(column.source.clone()))?;
-        if !output_names.insert(column.output.clone()) {
+    let mut projection = Vec::new();
+    for (expr, output) in expressions {
+        let (expr, data_type) = crate::expr::bind_scalar(expr, schema)?;
+        if !output_names.insert(output.clone()) {
             return Err(DbError::Unsupported(format!(
-                "повторяющееся имя результата '{}': укажите разные псевдонимы AS",
-                column.output
+                "повторяющееся имя результата '{output}': укажите разные псевдонимы AS"
             )));
         }
-        if !columns.contains(&column.source) {
-            columns.push(column.source.clone());
+        for name in expr.columns() {
+            if !columns.contains(&name) {
+                columns.push(name);
+            }
         }
         header.push(ColumnDef {
-            name: column.output.clone(),
-            data_type: definition.data_type,
+            name: output.clone(),
+            data_type,
+        });
+        projection.push(ProjectionColumn {
+            expr,
+            data_type,
+            output,
         });
     }
     let predicate = query
         .predicate
-        .map(|predicate| crate::expr::bind_predicate(predicate, schema))
+        .map(|p| crate::expr::bind_predicate(p, schema))
         .transpose()?;
     if let Some(predicate) = &predicate {
         for name in predicate.columns() {
