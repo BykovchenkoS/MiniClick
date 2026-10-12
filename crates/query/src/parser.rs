@@ -98,7 +98,8 @@ fn translate(query: Query) -> Result<SelectQuery> {
         (!sort_by.is_empty(), "SORT BY"),
         (having.is_some(), "HAVING"),
         (
-            !named_window.is_empty() || qualify.is_some(), "оконные выражения",
+            !named_window.is_empty() || qualify.is_some(),
+            "оконные выражения",
         ),
         (value_table_mode.is_some(), "AS VALUE / AS STRUCT"),
         (connect_by.is_some(), "CONNECT BY"),
