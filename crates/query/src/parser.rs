@@ -1,0 +1,286 @@
+use sqlparser::ast::{
+    Expr, GroupByExpr, Query, Select, SelectItem as SqlSelectItem, SetExpr, Statement, TableFactor,
+    WildcardAdditionalOptions,
+};
+use sqlparser::dialect::ClickHouseDialect;
+use sqlparser::parser::Parser;
+use types::{DbError, Result};
+
+use crate::ast::{SelectItem, SelectQuery};
+
+fn unsupported(feature: &str) -> DbError {
+    DbError::Unsupported(format!("Query: {feature} пока не поддерживается"))
+}
+
+pub(crate) fn parse(sql: &str) -> Result<SelectQuery> {
+    let mut statements = Parser::parse_sql(&ClickHouseDialect {}, sql)
+        .map_err(|e| DbError::Syntax(e.to_string()))?;
+    if statements.is_empty() {
+        return Err(DbError::Syntax("пустой SQL-запрос".into()));
+    }
+    if statements.len() != 1 {
+        return Err(unsupported("несколько SQL-команд за один вызов"));
+    }
+    let statement = statements.remove(0);
+    let Statement::Query(query) = statement else {
+        return Err(unsupported("команда, отличная от SELECT"));
+    };
+    translate(*query)
+}
+
+fn translate(query: Query) -> Result<SelectQuery> {
+    // Перечисляем все поля, обновление sqlparser потребует пересмотра адаптера.
+    let Query {
+        with,
+        body,
+        order_by,
+        limit,
+        limit_by,
+        offset,
+        fetch,
+        locks,
+        for_clause,
+        settings,
+        format_clause,
+    } = query;
+    for (present, name) in [
+        (with.is_some(), "WITH"),
+        (order_by.is_some(), "ORDER BY"),
+        (limit.is_some() || !limit_by.is_empty(), "LIMIT"),
+        (offset.is_some(), "OFFSET"),
+        (fetch.is_some(), "FETCH"),
+        (!locks.is_empty(), "блокировки SELECT"),
+        (for_clause.is_some(), "FOR"),
+        (settings.is_some(), "SETTINGS"),
+        (format_clause.is_some(), "FORMAT в SQL"),
+    ] {
+        if present {
+            return Err(unsupported(name));
+        }
+    }
+    let SetExpr::Select(select) = *body else {
+        return Err(unsupported("UNION, подзапрос или другая форма SELECT"));
+    };
+    let Select {
+        select_token: _,
+        distinct,
+        top,
+        top_before_distinct: _,
+        projection,
+        into,
+        from,
+        lateral_views,
+        prewhere,
+        selection,
+        group_by,
+        cluster_by,
+        distribute_by,
+        sort_by,
+        having,
+        named_window,
+        qualify,
+        window_before_qualify: _,
+        value_table_mode,
+        connect_by,
+    } = *select;
+    let has_group_by = !matches!(group_by,
+        GroupByExpr::Expressions(ref exprs, ref modifiers)
+            if exprs.is_empty() && modifiers.is_empty());
+    for (present, name) in [
+        (distinct.is_some(), "DISTINCT"),
+        (top.is_some(), "TOP"),
+        (into.is_some(), "SELECT INTO"),
+        (!lateral_views.is_empty(), "LATERAL VIEW"),
+        (prewhere.is_some(), "PREWHERE"),
+        (selection.is_some(), "WHERE"),
+        (has_group_by, "GROUP BY"),
+        (!cluster_by.is_empty(), "CLUSTER BY"),
+        (!distribute_by.is_empty(), "DISTRIBUTE BY"),
+        (!sort_by.is_empty(), "SORT BY"),
+        (having.is_some(), "HAVING"),
+        (
+            !named_window.is_empty() || qualify.is_some(), "оконные выражения",
+        ),
+        (value_table_mode.is_some(), "AS VALUE / AS STRUCT"),
+        (connect_by.is_some(), "CONNECT BY"),
+    ] {
+        if present {
+            return Err(unsupported(name));
+        }
+    }
+    if from.len() != 1 {
+        return Err(unsupported("SELECT без одной таблицы в FROM"));
+    }
+    let source = from.into_iter().next().expect("проверена одна таблица");
+    if !source.joins.is_empty() {
+        return Err(unsupported("JOIN"));
+    }
+    let table = match source.relation {
+        TableFactor::Table {
+            name,
+            alias,
+            args,
+            with_hints,
+            version,
+            with_ordinality,
+            partitions,
+            json_path,
+        } => {
+            if alias.is_some()
+                || args.is_some()
+                || !with_hints.is_empty()
+                || version.is_some()
+                || with_ordinality
+                || !partitions.is_empty()
+                || json_path.is_some()
+            {
+                return Err(unsupported(
+                    "псевдоним таблицы, табличная функция или модификатор FROM",
+                ));
+            }
+            if name.0.len() != 1 {
+                return Err(unsupported("составное имя таблицы"));
+            }
+            name.0.into_iter().next().expect("проверено одно имя").value
+        }
+        _ => return Err(unsupported("подзапрос или табличное выражение в FROM")),
+    };
+    let projection = projection
+        .into_iter()
+        .map(|item| match item {
+            SqlSelectItem::Wildcard(options) => {
+                let WildcardAdditionalOptions {
+                    wildcard_token: _,
+                    opt_ilike,
+                    opt_exclude,
+                    opt_except,
+                    opt_replace,
+                    opt_rename,
+                } = options;
+                if opt_ilike.is_some()
+                    || opt_exclude.is_some()
+                    || opt_except.is_some()
+                    || opt_replace.is_some()
+                    || opt_rename.is_some()
+                {
+                    return Err(unsupported("модификатор SELECT *"));
+                }
+                Ok(SelectItem::Wildcard)
+            }
+            SqlSelectItem::UnnamedExpr(Expr::Identifier(id)) => Ok(SelectItem::Column {
+                name: id.value,
+                alias: None,
+            }),
+            SqlSelectItem::ExprWithAlias {
+                expr: Expr::Identifier(id),
+                alias,
+            } => Ok(SelectItem::Column {
+                name: id.value,
+                alias: Some(alias.value),
+            }),
+            _ => Err(unsupported(
+                "выражение, агрегат или квалифицированная колонка в SELECT",
+            )),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if projection.is_empty() {
+        return Err(DbError::Syntax("пустой список SELECT".into()));
+    }
+    Ok(SelectQuery { table, projection })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translates_into_own_ast() {
+        assert_eq!(
+            parse("SELECT name AS label, id FROM events;").unwrap(),
+            SelectQuery {
+                table: "events".into(),
+                projection: vec![
+                    SelectItem::Column {
+                        name: "name".into(),
+                        alias: Some("label".into())
+                    },
+                    SelectItem::Column {
+                        name: "id".into(),
+                        alias: None
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn preserves_quoted_names_and_case() {
+        assert_eq!(
+            parse("select `User ID` from `Events`;").unwrap(),
+            SelectQuery {
+                table: "Events".into(),
+                projection: vec![SelectItem::Column {
+                    name: "User ID".into(),
+                    alias: None
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn ignores_comments_and_keyword_case() {
+        assert_eq!(
+            parse("-- demo\nsElEcT /* comment */ * FrOm events;").unwrap(),
+            SelectQuery {
+                table: "events".into(),
+                projection: vec![SelectItem::Wildcard]
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_empty_and_malformed_sql() {
+        for sql in [
+            "",
+            "-- only comment",
+            "SELECT * FROM",
+            "SELECT id AS FROM events",
+        ] {
+            assert!(matches!(parse(sql), Err(DbError::Syntax(_))), "{sql}");
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_ast_without_ignoring_clauses() {
+        for sql in [
+            "SELECT * FROM events WHERE id = 1",
+            "SELECT * FROM events PREWHERE id = 1",
+            "SELECT * FROM events LIMIT 1",
+            "SELECT * FROM events ORDER BY id",
+            "SELECT DISTINCT id FROM events",
+            "SELECT id FROM events GROUP BY id",
+            "SELECT count() FROM events",
+            "SELECT id + 1 FROM events",
+            "SELECT 1",
+            "SELECT * FROM events, other",
+            "SELECT * FROM events JOIN other ON events.id = other.id",
+            "SELECT * FROM (SELECT * FROM events)",
+            "SELECT * FROM events UNION ALL SELECT * FROM events",
+            "SELECT * FROM events e",
+            "SELECT events.id FROM events",
+            "SELECT * FROM db.events",
+            "SELECT * FROM events FORMAT JSON",
+            "SELECT * FROM events SETTINGS max_threads = 1",
+            "SELECT * EXCEPT (id) FROM events",
+            "SELECT * FROM events; SELECT * FROM other",
+            "DROP TABLE events",
+            "WITH t AS (SELECT * FROM events) SELECT * FROM t",
+        ] {
+            let result = parse(sql);
+            assert!(
+                matches!(result, Err(DbError::Unsupported(_))),
+                "{sql}: {result:?}"
+            );
+        }
+    }
+}
