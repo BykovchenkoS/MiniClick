@@ -29,6 +29,7 @@ impl MergeTreeTable {
     }
 }
 
+/// Фабрика MergeTree для регистрации в Catalog; data_dir уже задаёт каталог таблицы.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MergeTreeFactory;
 

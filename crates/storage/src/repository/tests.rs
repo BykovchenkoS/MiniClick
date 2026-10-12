@@ -127,3 +127,101 @@ fn interrupted_publication_keeps_previous_set_and_failed_manifest_does_not_chang
     );
     assert!(!root.path().join(merged.name()).exists());
 }
+
+#[test]
+fn crash_writer_process() {
+    let Ok(root) = std::env::var("MINICLICK_CRASH_ROOT") else {
+        return;
+    };
+    let mode = std::env::var("MINICLICK_CRASH_MODE").unwrap();
+    let def = definition(Codec::Lz4);
+    let table = crate::MergeTreeTable::open(&def, Path::new(&root)).unwrap();
+    use types::Table;
+    table.insert(block(&[3, 1], &["c", "a"])).unwrap();
+    table.insert(block(&[2], &["b"])).unwrap();
+    if mode == "before" {
+        let parts = table.repository.snapshot().unwrap();
+        let (id, _) = crate::merge::merged_id(&parts).unwrap();
+        crate::merge::write_merge(Path::new(&root), id, &def, &parts).unwrap();
+    } else {
+        let _old_reader = table.scan(&types::ScanRequest::default()).unwrap();
+        table.optimize().unwrap();
+        assert!(Path::new(&root).join("all_1_1_0").exists());
+        // exit намеренно пропускает Drop: исходные каталоги остаются на диске.
+        std::process::exit(0);
+    }
+    std::process::exit(0);
+}
+
+#[test]
+fn abrupt_process_exit_before_and_after_merge_commit_recovers_without_duplicates() {
+    use types::{ColumnData, ScanRequest, Table};
+    for mode in ["before", "after"] {
+        let root = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "repository::tests::crash_writer_process",
+                "--nocapture",
+            ])
+            .env("MINICLICK_CRASH_ROOT", root.path())
+            .env("MINICLICK_CRASH_MODE", mode)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(root.path().join("all_1_1_0").exists());
+        assert!(root.path().join("all_1_2_1").exists());
+        let table = crate::MergeTreeTable::open(&definition(Codec::Lz4), root.path()).unwrap();
+        assert_eq!(
+            table.parts().unwrap().len(),
+            if mode == "before" { 2 } else { 1 }
+        );
+        let request = ScanRequest {
+            columns: vec!["id".into()],
+            predicate: None,
+        };
+        let mut ids: Vec<i64> = Vec::new();
+        for block in table.scan(&request).unwrap() {
+            let block = block.unwrap();
+            let ColumnData::Int64(values) = block.column("id").unwrap() else {
+                panic!("id type")
+            };
+            ids.extend_from_slice(values);
+        }
+        ids.sort();
+        assert_eq!(ids, [1, 2, 3]);
+        if mode == "before" {
+            assert!(!root.path().join("all_1_2_1").exists());
+        } else {
+            assert!(!root.path().join("all_1_1_0").exists());
+        }
+        table.insert(block(&[4], &["d"])).unwrap();
+        assert!(table.parts().unwrap().contains(&"all_3_3_0".into()));
+    }
+}
+
+#[test]
+fn corrupted_manifest_or_index_is_rejected_instead_of_silently_dropping_rows() {
+    for damaged in [
+        "table.json",
+        "all_1_1_0/primary.idx",
+        "all_1_1_0/part.json",
+        "all_1_1_0/text.mrk",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let def = definition(Codec::None);
+        let repo = PartRepository::open(root.path(), &def).unwrap();
+        insert(&repo, &def, 1);
+        drop(repo);
+        fs::write(root.path().join(damaged), [0]).unwrap();
+        assert!(
+            PartRepository::open(root.path(), &def).is_err(),
+            "{damaged}"
+        );
+        assert!(root.path().join("all_1_1_0").exists());
+    }
+}

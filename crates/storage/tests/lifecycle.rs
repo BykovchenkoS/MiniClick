@@ -336,3 +336,322 @@ fn optimize_errors_leave_original_parts_active_and_allow_retry() {
         [(1, "a".into()), (2, "b".into()), (3, "c".into())]
     );
 }
+
+fn all_types_block() -> Block {
+    use types::Column;
+    Block::new(vec![
+        Column {
+            name: "id".into(),
+            data: ColumnData::Int64(vec![-9, 2, i64::MAX]),
+        },
+        Column {
+            name: "unsigned".into(),
+            data: ColumnData::UInt64(vec![u64::MAX, 0, (1 << 53) + 1]),
+        },
+        Column {
+            name: "float".into(),
+            data: ColumnData::Float64(vec![
+                f64::from_bits(0x7ff8000000000042),
+                -0.0,
+                f64::INFINITY,
+            ]),
+        },
+        Column {
+            name: "text".into(),
+            data: ColumnData::String(vec!["я\0🦀".into(), "".into(), "end".into()]),
+        },
+        Column {
+            name: "date".into(),
+            data: ColumnData::Date(vec![i32::MIN, 0, i32::MAX]),
+        },
+        Column {
+            name: "time".into(),
+            data: ColumnData::DateTime(vec![i64::MIN, 0, i64::MAX]),
+        },
+    ])
+    .unwrap()
+}
+
+fn assert_same_values(actual: &Block, expected: &Block) {
+    assert_eq!(actual.header(), expected.header());
+    assert_eq!(actual.rows(), expected.rows());
+    let sort_by_id = |block: &Block| {
+        let ColumnData::Int64(ids) = block.column("id").unwrap() else {
+            panic!("id type")
+        };
+        let mut indices: Vec<_> = (0..block.rows()).collect();
+        indices.sort_by_key(|&i| ids[i]);
+        block.take(&indices)
+    };
+    let actual = sort_by_id(actual);
+    let expected = sort_by_id(expected);
+    for (a, b) in actual.columns().iter().zip(expected.columns()) {
+        for row in 0..actual.rows() {
+            assert_eq!(
+                a.data.get(row).compare(&b.data.get(row)),
+                Some(std::cmp::Ordering::Equal),
+                "{} row {row}",
+                a.name
+            );
+        }
+    }
+}
+
+#[test]
+fn all_six_types_as_keys_survive_insert_merge_restart_and_pruning_for_every_codec() {
+    for codec in [Codec::None, Codec::Lz4, Codec::Zstd] {
+        for key in ["id", "unsigned", "float", "text", "date", "time"] {
+            let root = tempfile::tempdir().unwrap();
+            let input = all_types_block();
+            let mut def = definition(codec);
+            def.schema.columns = input.header();
+            def.order_by = vec![key.into(), "id".into()];
+            if key == "id" {
+                def.order_by.pop();
+            }
+            let table = MergeTreeTable::open(&def, root.path()).unwrap();
+            table.insert(input.clone()).unwrap();
+            table.insert(input.clone()).unwrap();
+            let request = ScanRequest {
+                columns: def.schema.names(),
+                predicate: None,
+            };
+            let expected = Block::concat(&[input.clone(), input.clone()]).unwrap();
+            assert_same_values(&Block::concat(&read(&table, &request)).unwrap(), &expected);
+            table.optimize().unwrap();
+            assert_same_values(&Block::concat(&read(&table, &request)).unwrap(), &expected);
+            drop(table);
+            let table = MergeTreeTable::open(&def, root.path()).unwrap();
+            assert_same_values(&Block::concat(&read(&table, &request)).unwrap(), &expected);
+            let literal = input.column(key).unwrap().get(1);
+            let filtered = ScanRequest {
+                columns: request.columns.clone(),
+                predicate: Some(Expr::binary(
+                    BinaryOp::Eq,
+                    Expr::col(key),
+                    Expr::lit(literal.clone()),
+                )),
+            };
+            let pruned = Block::concat(&read(&table, &filtered)).unwrap();
+            let mask = (0..pruned.rows())
+                .map(|i| {
+                    pruned.column(key).unwrap().get(i).compare(&literal)
+                        == Some(std::cmp::Ordering::Equal)
+                })
+                .collect::<Vec<_>>();
+            assert_same_values(
+                &pruned.filter(&mask),
+                &Block::concat(&[input.slice(1, 1), input.slice(1, 1)]).unwrap(),
+            );
+            assert_eq!(
+                table.explain_scan(&filtered).unwrap().rows_selected as usize,
+                pruned.rows()
+            );
+        }
+    }
+}
+
+#[test]
+fn concurrent_insert_optimize_and_scan_preserve_every_row_exactly_once() {
+    use std::sync::{Arc, Barrier};
+    let root = tempfile::tempdir().unwrap();
+    let table = Arc::new(MergeTreeTable::open(&definition(Codec::Lz4), root.path()).unwrap());
+    let barrier = Arc::new(Barrier::new(6));
+    let request = ScanRequest {
+        columns: vec!["id".into(), "text".into()],
+        predicate: None,
+    };
+    std::thread::scope(|scope| {
+        for writer in 0..4 {
+            let table = table.clone();
+            let barrier = barrier.clone();
+            scope.spawn(move || {
+                barrier.wait();
+                for row in 0..10 {
+                    table.insert(block(&[writer * 10 + row], &["x"])).unwrap();
+                }
+            });
+        }
+        let optimize_table = table.clone();
+        let optimize_barrier = barrier.clone();
+        scope.spawn(move || {
+            optimize_barrier.wait();
+            for _ in 0..10 {
+                optimize_table.optimize().unwrap();
+            }
+        });
+        let scan_table = table.clone();
+        let scan_request = request.clone();
+        scope.spawn(move || {
+            barrier.wait();
+            for _ in 0..40 {
+                let observed = rows(&read(scan_table.as_ref(), &scan_request));
+                assert!(observed.iter().all(|(id, _)| (0..40).contains(id)));
+                assert!(observed.windows(2).all(|pair| pair[0].0 != pair[1].0));
+            }
+        });
+    });
+    table.optimize().unwrap();
+    let actual = rows(&read(table.as_ref(), &request));
+    assert_eq!(
+        actual,
+        (0..40).map(|id| (id, "x".into())).collect::<Vec<_>>()
+    );
+    assert_eq!(table.parts().unwrap().len(), 1);
+}
+
+#[test]
+#[ignore = "Нагрузочная проверка миллиона строк, запускается отдельно в release"]
+fn million_rows_survive_merge_restart_and_use_sparse_index() {
+    use std::time::Instant;
+    const ROWS: i64 = 1_000_000;
+    let root = tempfile::tempdir().unwrap();
+    let mut def = definition(Codec::Lz4);
+    def.order_by = vec!["id".into()];
+    def.settings.index_granularity = 8192;
+    let table = MergeTreeTable::open(&def, root.path()).unwrap();
+    let started = Instant::now();
+    for start in [0, ROWS / 2] {
+        let ids = (start..start + ROWS / 2).rev().collect();
+        let input = Block::new(vec![
+            types::Column {
+                name: "id".into(),
+                data: ColumnData::Int64(ids),
+            },
+            types::Column {
+                name: "text".into(),
+                data: ColumnData::String(vec!["event".into(); (ROWS / 2) as usize]),
+            },
+        ])
+        .unwrap();
+        table.insert(input).unwrap();
+    }
+    let insert_time = started.elapsed();
+    let full = ScanRequest {
+        columns: vec!["id".into()],
+        predicate: None,
+    };
+    let started = Instant::now();
+    let verify = |table: &dyn Table| {
+        let mut expected = 0;
+        for block in table.scan(&full).unwrap() {
+            let block = block.unwrap();
+            let ColumnData::Int64(ids) = block.column("id").unwrap() else {
+                panic!("id type")
+            };
+            for &id in ids {
+                assert_eq!(id, expected);
+                expected += 1;
+            }
+        }
+        assert_eq!(expected, ROWS);
+    };
+    verify(&table);
+    let scan_time = started.elapsed();
+    let selective = ScanRequest {
+        columns: vec!["id".into()],
+        predicate: Some(Expr::binary(
+            BinaryOp::Eq,
+            Expr::col("id"),
+            Expr::lit(Value::Int64(500001)),
+        )),
+    };
+    let started = Instant::now();
+    let mut matches = 0;
+    for block in table.scan(&selective).unwrap() {
+        let block = block.unwrap();
+        let ColumnData::Int64(ids) = block.column("id").unwrap() else {
+            panic!("id type")
+        };
+        matches += ids.iter().filter(|&&id| id == 500001).count();
+    }
+    assert_eq!(matches, 1);
+    let selective_time = started.elapsed();
+    let stats = table.explain_scan(&selective).unwrap();
+    assert_eq!(
+        (
+            stats.parts_total,
+            stats.parts_selected,
+            stats.granules_total,
+            stats.granules_selected,
+            stats.rows_total,
+            stats.rows_selected
+        ),
+        (2, 1, 124, 1, ROWS as u64, 8192)
+    );
+    let started = Instant::now();
+    table.optimize().unwrap();
+    let merge_time = started.elapsed();
+    assert_eq!(table.parts().unwrap(), ["all_1_2_1"]);
+    verify(&table);
+    drop(table);
+    let table = MergeTreeTable::open(&def, root.path()).unwrap();
+    verify(&table);
+    assert_eq!(table.explain_scan(&selective).unwrap().granules_selected, 1);
+    println!("INSERT: {insert_time:?}; scan: {scan_time:?}; по ключу: {selective_time:?}; OPTIMIZE: {merge_time:?}; гранулы: 1/124");
+}
+
+#[test]
+fn reopening_with_another_codec_preserves_old_parts_and_writes_new_frames() {
+    let root = tempfile::tempdir().unwrap();
+    let mut def = definition(Codec::None);
+    let table = MergeTreeTable::open(&def, root.path()).unwrap();
+    table.insert(block(&[1], &["old"])).unwrap();
+    drop(table);
+    def.settings.codec = Codec::Zstd;
+    let table = MergeTreeTable::open(&def, root.path()).unwrap();
+    table.insert(block(&[2], &["new"])).unwrap();
+    assert_eq!(
+        std::fs::read(root.path().join("all_1_1_0/id.bin")).unwrap()[0],
+        0
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("all_2_2_0/id.bin")).unwrap()[0],
+        2
+    );
+    let request = ScanRequest {
+        columns: vec!["id".into(), "text".into()],
+        predicate: None,
+    };
+    assert_eq!(
+        rows(&read(&table, &request)),
+        [(1, "old".into()), (2, "new".into())]
+    );
+    table.optimize().unwrap();
+    assert_eq!(
+        std::fs::read(root.path().join("all_1_2_1/id.bin")).unwrap()[0],
+        2
+    );
+    drop(table);
+    let table = MergeTreeTable::open(&def, root.path()).unwrap();
+    assert_eq!(
+        rows(&read(&table, &request)),
+        [(1, "old".into()), (2, "new".into())]
+    );
+}
+
+#[test]
+fn reopening_with_changed_key_schema_or_granularity_is_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let def = definition(Codec::None);
+    let table = MergeTreeTable::open(&def, root.path()).unwrap();
+    table.insert(block(&[1, 2], &["a", "b"])).unwrap();
+    drop(table);
+    let mut changed = def.clone();
+    changed.order_by.reverse();
+    assert!(MergeTreeTable::open(&changed, root.path()).is_err());
+    changed = def.clone();
+    changed.settings.index_granularity = 4;
+    assert!(MergeTreeTable::open(&changed, root.path()).is_err());
+    changed = def.clone();
+    changed.schema.columns[0].data_type = types::DataType::UInt64;
+    assert!(MergeTreeTable::open(&changed, root.path()).is_err());
+    let table = MergeTreeTable::open(&def, root.path()).unwrap();
+    assert_eq!(
+        table
+            .explain_scan(&ScanRequest::default())
+            .unwrap()
+            .rows_total,
+        2
+    );
+}
