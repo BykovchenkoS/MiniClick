@@ -144,15 +144,6 @@ fn frames_reject_invalid_sizes_unknown_codecs_and_partial_headers() {
     bytes = valid;
     bytes[0] = 3;
     assert_corrupt(decode_frame(&bytes));
-    for (id, codec) in [(1, Codec::Lz4), (2, Codec::Zstd)] {
-        assert!(matches!(
-            encode_frame(&[], codec),
-            Err(DbError::Unsupported(_))
-        ));
-        let mut bytes = [0; 9];
-        bytes[0] = id;
-        assert!(matches!(decode_frame(&bytes), Err(DbError::Unsupported(_))));
-    }
 }
 
 #[test]
@@ -316,4 +307,34 @@ fn metadata_rejects_versions_invalid_counts_and_bounds() {
     m.min_key[0] = Value::Float64(f64::NAN);
     m.max_key[0] = Value::Float64(1.0);
     assert_corrupt(encode_meta(&m));
+}
+
+#[test]
+fn compressed_frames_preserve_data_and_reject_invalid_streams() {
+    for codec in [Codec::Lz4, Codec::Zstd] {
+        for payload in [vec![], vec![42], vec![7; 65536], (0..=255).collect()] {
+            let frame = encode_frame(&payload, codec).unwrap();
+            assert_eq!(frame[0], if codec == Codec::Lz4 { 1 } else { 2 });
+            assert_eq!(decode_frame(&frame).unwrap(), payload);
+            let mut wrong_size = frame.clone();
+            wrong_size[5..9].copy_from_slice(&((payload.len() + 1) as u32).to_le_bytes());
+            assert_corrupt(decode_frame(&wrong_size));
+            assert_corrupt(decode_frame(&frame[..frame.len() - 1]));
+        }
+        let mut invalid = vec![if codec == Codec::Lz4 { 1 } else { 2 }];
+        invalid.extend_from_slice(&3u32.to_le_bytes());
+        invalid.extend_from_slice(&8u32.to_le_bytes());
+        invalid.extend_from_slice(&[255; 3]);
+        assert_corrupt(decode_frame(&invalid));
+        assert!(encode_frame(&[0; 65536], codec).unwrap().len() < 65536);
+    }
+}
+
+#[test]
+fn untrusted_frame_size_is_rejected_before_allocation() {
+    for codec in [Codec::None, Codec::Lz4, Codec::Zstd] {
+        let mut frame = encode_frame(&[], codec).unwrap();
+        frame[5..9].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_corrupt(decode_frame(&frame));
+    }
 }

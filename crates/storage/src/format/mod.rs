@@ -6,6 +6,8 @@ use types::{Codec, ColumnData, ColumnDef, DataType, DbError, Result, Value};
 pub(crate) const FORMAT_VERSION: u32 = 1;
 pub(crate) const MARK_SIZE: usize = 12;
 pub(crate) const FRAME_HEADER_SIZE: usize = 9;
+// Ограничение одной гранулы защищает распаковку от испорченных размеров.
+pub(crate) const MAX_FRAME_SIZE: usize = 256 * 1024 * 1024;
 
 fn corrupt(message: impl Into<String>) -> DbError {
     DbError::Internal(format!("invalid part format: {}", message.into()))
@@ -143,17 +145,22 @@ fn read_codec(id: u8) -> Result<Codec> {
 }
 
 pub(crate) fn encode_frame(bytes: &[u8], codec: Codec) -> Result<Vec<u8>> {
-    if codec != Codec::None {
-        return Err(DbError::Unsupported(
-            "compressed frames are not implemented".into(),
-        ));
+    if bytes.len() > MAX_FRAME_SIZE {
+        return Err(corrupt("frame exceeds 256 MiB limit"));
     }
     let size = u32::try_from(bytes.len()).map_err(|_| corrupt("frame size exceeds u32"))?;
+    let payload = match codec {
+        Codec::None => bytes.to_vec(),
+        Codec::Lz4 => lz4_flex::block::compress(bytes),
+        Codec::Zstd => zstd::bulk::compress(bytes, 3).map_err(DbError::Io)?,
+    };
+    let compressed =
+        u32::try_from(payload.len()).map_err(|_| corrupt("compressed frame size exceeds u32"))?;
     let mut frame = Vec::new();
     frame.push(codec_id(codec));
+    frame.extend_from_slice(&compressed.to_le_bytes());
     frame.extend_from_slice(&size.to_le_bytes());
-    frame.extend_from_slice(&size.to_le_bytes());
-    frame.extend_from_slice(bytes);
+    frame.extend_from_slice(&payload);
     Ok(frame)
 }
 
@@ -163,17 +170,33 @@ pub(crate) fn decode_frame(bytes: &[u8]) -> Result<Vec<u8>> {
     let codec = read_codec(reader.array::<1>()?[0])?;
     let compressed = u32::from_le_bytes(reader.array()?) as usize;
     let original = u32::from_le_bytes(reader.array()?) as usize;
+    if original > MAX_FRAME_SIZE {
+        return Err(corrupt("frame exceeds 256 MiB limit"));
+    }
     let payload = reader.take(compressed)?;
     reader.finish()?;
-    if codec != Codec::None {
-        return Err(DbError::Unsupported(
-            "compressed frames are not implemented".into(),
-        ));
+    let decoded = match codec {
+        Codec::None => payload.to_vec(),
+        Codec::Lz4 => {
+            // Поток ограничен ожидаемой длиной даже при испорченном заголовке.
+            let mut output = Vec::new();
+            output
+                .try_reserve_exact(original)
+                .map_err(|_| corrupt("frame allocation failed"))?;
+            output.resize(original, 0);
+            let size = lz4_flex::block::decompress_into(payload, &mut output)
+                .map_err(|e| corrupt(format!("LZ4: {e}")))?;
+            output.truncate(size);
+            output
+        }
+        Codec::Zstd => {
+            zstd::bulk::decompress(payload, original).map_err(|e| corrupt(format!("ZSTD: {e}")))?
+        }
+    };
+    if decoded.len() != original {
+        return Err(corrupt("decoded frame size differs from header"));
     }
-    if compressed != original {
-        return Err(corrupt("uncompressed frame sizes differ"));
-    }
-    Ok(payload.to_vec())
+    Ok(decoded)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
