@@ -13,4 +13,5 @@ mod table;
 
 pub use table::{MergeTreeFactory, MergeTreeTable};
 
+mod merge;
 mod scan;

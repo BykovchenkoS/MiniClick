@@ -267,3 +267,72 @@ fn pruning_never_loses_matches_at_duplicate_keys_or_inclusive_boundaries() {
     };
     assert_eq!(table.explain_scan(&unsupported).unwrap().rows_selected, 9);
 }
+
+#[test]
+fn optimize_preserves_duplicates_old_readers_and_data_after_restart() {
+    for codec in [Codec::None, Codec::Lz4, Codec::Zstd] {
+        let root = tempfile::tempdir().unwrap();
+        let def = definition(codec);
+        let table = MergeTreeTable::open(&def, root.path()).unwrap();
+        table.optimize().unwrap();
+        for _ in 0..9 {
+            table.insert(block(&[3, 1, 1], &["c", "b", "a"])).unwrap();
+        }
+        let request = ScanRequest {
+            columns: vec!["id".into(), "text".into()],
+            predicate: None,
+        };
+        let before = rows(&read(&table, &request));
+        let old = table.scan(&request).unwrap();
+        table.optimize().unwrap();
+        assert_eq!(table.parts().unwrap().len(), 1);
+        assert_eq!(rows(&read(&table, &request)), before);
+        assert_eq!(table.explain_scan(&request).unwrap().rows_total, 27);
+        assert!(root.path().join("all_1_1_0").exists());
+        assert_eq!(
+            rows(&old.collect::<types::Result<Vec<_>>>().unwrap()),
+            before
+        );
+        assert!(!root.path().join("all_1_1_0").exists());
+        let merged = table.parts().unwrap();
+        table.optimize().unwrap();
+        assert_eq!(table.parts().unwrap(), merged);
+        drop(table);
+        let table = MergeTreeTable::open(&def, root.path()).unwrap();
+        assert_eq!(rows(&read(&table, &request)), before);
+        table.insert(block(&[0], &["new"])).unwrap();
+        assert!(table.parts().unwrap().contains(&"all_10_10_0".into()));
+    }
+}
+
+#[test]
+fn optimize_errors_leave_original_parts_active_and_allow_retry() {
+    let root = tempfile::tempdir().unwrap();
+    let table = MergeTreeTable::open(&definition(Codec::None), root.path()).unwrap();
+    table.insert(block(&[2, 1], &["b", "a"])).unwrap();
+    table.insert(block(&[3], &["c"])).unwrap();
+    let original = table.parts().unwrap();
+    let path = root.path().join("all_2_2_0/id.bin");
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::write(&path, [255]).unwrap();
+    assert!(table.optimize().is_err());
+    assert_eq!(table.parts().unwrap(), original);
+    assert!(!root.path().join("all_1_2_1").exists());
+    assert!(!root.path().join("tmp_all_1_2_1").exists());
+    std::fs::write(&path, bytes).unwrap();
+    std::fs::create_dir(root.path().join("tmp_table.json")).unwrap();
+    assert!(table.optimize().is_err());
+    assert_eq!(table.parts().unwrap(), original);
+    assert!(!root.path().join("all_1_2_1").exists());
+    std::fs::remove_dir(root.path().join("tmp_table.json")).unwrap();
+    table.optimize().unwrap();
+    assert_eq!(table.parts().unwrap(), ["all_1_2_1"]);
+    let request = ScanRequest {
+        columns: vec!["id".into(), "text".into()],
+        predicate: None,
+    };
+    assert_eq!(
+        rows(&read(&table, &request)),
+        [(1, "a".into()), (2, "b".into()), (3, "c".into())]
+    );
+}

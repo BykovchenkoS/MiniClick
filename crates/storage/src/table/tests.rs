@@ -3,7 +3,7 @@ use crate::{
     part::PartReader,
     test_support::{block, definition},
 };
-use types::{Codec, ColumnData, Engine};
+use types::{Codec, ColumnData, DbError, Engine};
 
 #[test]
 fn insert_preserves_schema_atomicity_and_unique_names_after_restart() {

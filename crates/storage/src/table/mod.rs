@@ -1,5 +1,6 @@
 //! Реализация MergeTree через общий контракт Table.
 
+use crate::merge;
 use crate::part::{internal, sync_directory, validate_block, write_part};
 use crate::repository::PartRepository;
 use crate::scan::{self, ScanStream};
@@ -7,8 +8,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use types::{
-    Block, BlockStream, DbError, Result, ScanRequest, ScanStats, Table, TableDefinition,
-    TableFactory,
+    Block, BlockStream, Result, ScanRequest, ScanStats, Table, TableDefinition, TableFactory,
 };
 
 /// Постоянная таблица; изменения сериализуются, читатели держат снимки parts.
@@ -99,10 +99,32 @@ impl Table for MergeTreeTable {
     }
 
     fn optimize(&self) -> Result<()> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| internal("table write lock poisoned"))?;
         self.repository.check_live()?;
-        Err(DbError::Unsupported(
-            "MergeTree optimize is not implemented yet".into(),
-        ))
+        loop {
+            let selected = merge::select(&self.repository.snapshot()?);
+            if selected.is_empty() {
+                return Ok(());
+            }
+            let (id, remove) = merge::merged_id(&selected)?;
+            let result = (|| {
+                merge::write_merge(&self.repository.root, id, &self.definition, &selected)?;
+                self.repository
+                    .replace(vec![(id, self.repository.open_part(id)?)], &remove)
+            })();
+            if result.is_err() {
+                let path = self.repository.root.join(id.name());
+                if let Err(error) = fs::remove_dir_all(&path) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(?path, %error, "Не удалось удалить неопубликованный merge");
+                    }
+                }
+            }
+            result?;
+        }
     }
 
     fn drop_data(&self) -> Result<()> {

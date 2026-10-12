@@ -276,7 +276,9 @@ pub(crate) struct PartMeta {
     pub granules: u32,
     pub columns: Vec<ColumnDef>,
     pub codec: Codec,
+    #[serde(with = "key_values")]
     pub min_key: Vec<Value>,
+    #[serde(with = "key_values")]
     pub max_key: Vec<Value>,
 }
 
@@ -304,12 +306,6 @@ impl PartMeta {
         }
         let mut order = std::cmp::Ordering::Equal;
         for (min, max) in self.min_key.iter().zip(&self.max_key) {
-            if [min, max]
-                .iter()
-                .any(|v| matches!(v, Value::Float64(x) if !x.is_finite()))
-            {
-                return Err(corrupt("non-finite metadata key"));
-            }
             let comparison = min
                 .compare(max)
                 .ok_or_else(|| corrupt("key types differ"))?;
@@ -338,3 +334,41 @@ pub(crate) fn decode_meta(bytes: &[u8]) -> Result<PartMeta> {
 
 #[cfg(test)]
 mod tests;
+
+/// JSON-числа не сохраняют NaN и все битовые особенности Float64.
+mod key_values {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use types::Value;
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(untagged)]
+    enum StoredValue {
+        FloatBits { float64_bits: u64 },
+        Plain(Value),
+    }
+
+    pub fn serialize<S: Serializer>(values: &[Value], serializer: S) -> Result<S::Ok, S::Error> {
+        values
+            .iter()
+            .map(|value| match value {
+                Value::Float64(number) => StoredValue::FloatBits {
+                    float64_bits: number.to_bits(),
+                },
+                other => StoredValue::Plain(other.clone()),
+            })
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Value>, D::Error> {
+        Ok(Vec::<StoredValue>::deserialize(deserializer)?
+            .into_iter()
+            .map(|value| match value {
+                StoredValue::FloatBits { float64_bits } => {
+                    Value::Float64(f64::from_bits(float64_bits))
+                }
+                StoredValue::Plain(value) => value,
+            })
+            .collect())
+    }
+}

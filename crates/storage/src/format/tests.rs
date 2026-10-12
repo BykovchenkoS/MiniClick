@@ -303,10 +303,6 @@ fn metadata_rejects_versions_invalid_counts_and_bounds() {
     for bytes in [b"{".as_slice(), b"{}", b"null"] {
         assert_corrupt(decode_meta(bytes));
     }
-    let mut m = meta();
-    m.min_key[0] = Value::Float64(f64::NAN);
-    m.max_key[0] = Value::Float64(1.0);
-    assert_corrupt(encode_meta(&m));
 }
 
 #[test]
@@ -336,5 +332,31 @@ fn untrusted_frame_size_is_rejected_before_allocation() {
         let mut frame = encode_frame(&[], codec).unwrap();
         frame[5..9].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_corrupt(decode_frame(&frame));
+    }
+}
+
+#[test]
+fn metadata_preserves_exact_float_bits_including_non_finite_bounds() {
+    for bits in [
+        0u64,
+        (-0.0f64).to_bits(),
+        f64::INFINITY.to_bits(),
+        f64::NEG_INFINITY.to_bits(),
+        0x7ff8000000000042,
+        0xfff8000000000042,
+        0x3fd5555555555555,
+    ] {
+        let mut m = meta();
+        m.columns[0].data_type = DataType::Float64;
+        m.min_key = vec![Value::Float64(f64::from_bits(bits))];
+        m.max_key = m.min_key.clone();
+        let bytes = encode_meta(&m).unwrap();
+        let decoded = decode_meta(&bytes).unwrap();
+        for key in [decoded.min_key, decoded.max_key] {
+            let Value::Float64(value) = key[0] else {
+                panic!("float key")
+            };
+            assert_eq!(value.to_bits(), bits);
+        }
     }
 }
