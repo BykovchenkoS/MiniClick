@@ -110,7 +110,7 @@ fn reader_returns_requested_columns_and_exact_granules_for_all_codecs() {
             &block(&[5, 2, 4, 1, 3], &["e", "b", "d", "a", "c"]),
         )
         .unwrap();
-        let part = DataPart::open(&root.path().join("all_1_1_0"), &def).unwrap();
+        let part = Arc::new(DataPart::open(&root.path().join("all_1_1_0"), &def).unwrap());
         let mut reader = PartReader::new(&part, &["text".into(), "id".into()]).unwrap();
         assert_eq!(
             reader.read_granule(1).unwrap(),
@@ -168,7 +168,7 @@ fn reader_rejects_inconsistent_metadata_marks_index_and_column_frames() {
         let path = root.path().join("all_1_1_0");
         fs::write(path.join(damaged), [0]).unwrap();
         if damaged == "id.bin" {
-            let part = DataPart::open(&path, &def).unwrap();
+            let part = Arc::new(DataPart::open(&path, &def).unwrap());
             assert!(PartReader::new(&part, &["id".into()])
                 .unwrap()
                 .read_granule(0)

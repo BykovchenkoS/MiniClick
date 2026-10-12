@@ -419,14 +419,14 @@ impl Drop for DataPart {
 }
 
 /// Файлы сохраняются между чтениями гранул; чтение начинается по меткам.
-pub(crate) struct PartReader<'a> {
-    part: &'a DataPart,
+pub(crate) struct PartReader {
+    part: Arc<DataPart>,
     columns: Vec<usize>,
     files: Vec<File>,
 }
 
-impl<'a> PartReader<'a> {
-    pub fn new(part: &'a DataPart, names: &[String]) -> Result<Self> {
+impl PartReader {
+    pub fn new(part: &Arc<DataPart>, names: &[String]) -> Result<Self> {
         part.check_live()?;
         let mut columns = Vec::new();
         let mut files = Vec::new();
@@ -444,7 +444,7 @@ impl<'a> PartReader<'a> {
             files.push(File::open(part.path.join(format!("{name}.bin")))?);
         }
         Ok(Self {
-            part,
+            part: part.clone(),
             columns,
             files,
         })

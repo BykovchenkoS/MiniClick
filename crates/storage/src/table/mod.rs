@@ -2,6 +2,7 @@
 
 use crate::part::{internal, sync_directory, validate_block, write_part};
 use crate::repository::PartRepository;
+use crate::scan::{self, ScanStream};
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -69,16 +70,13 @@ impl Table for MergeTreeTable {
         result
     }
 
-    fn scan(&self, _request: &ScanRequest) -> Result<BlockStream> {
-        Err(DbError::Unsupported(
-            "MergeTree scan is not implemented yet".into(),
-        ))
+    fn scan(&self, request: &ScanRequest) -> Result<BlockStream> {
+        let plan = scan::plan(&self.definition, self.repository.snapshot()?, request)?;
+        Ok(ScanStream::into_stream(plan, request.columns.clone()))
     }
 
-    fn explain_scan(&self, _request: &ScanRequest) -> Result<ScanStats> {
-        Err(DbError::Unsupported(
-            "MergeTree explain_scan is not implemented yet".into(),
-        ))
+    fn explain_scan(&self, request: &ScanRequest) -> Result<ScanStats> {
+        Ok(scan::plan(&self.definition, self.repository.snapshot()?, request)?.stats)
     }
 
     fn flush(&self) -> Result<()> {
