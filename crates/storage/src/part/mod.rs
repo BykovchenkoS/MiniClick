@@ -4,6 +4,10 @@ use std::cmp::Ordering;
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
+    Arc,
+};
 use types::{Block, Column, ColumnData, DbError, Engine, Result, TableDefinition, Value};
 
 use crate::format::{self, Mark, PartMeta, FORMAT_VERSION};
@@ -291,6 +295,8 @@ pub(crate) struct DataPart {
     pub meta: PartMeta,
     pub marks: Vec<Vec<Mark>>,
     pub index: Vec<ColumnData>,
+    pub lease: Option<Arc<crate::repository::DirectoryLease>>,
+    retired: AtomicBool,
 }
 
 impl DataPart {
@@ -358,6 +364,8 @@ impl DataPart {
             meta,
             marks,
             index,
+            lease: None,
+            retired: AtomicBool::new(false),
         };
         if compare_keys(&part.key(0), &part.meta.min_key)? != Ordering::Equal {
             return Err(internal("first index key differs from minimum"));
@@ -376,12 +384,37 @@ impl DataPart {
         Ok(part)
     }
 
+    pub fn check_live(&self) -> Result<()> {
+        if self.lease.as_ref().is_some_and(|lease| lease.is_dropped()) {
+            return Err(internal("table was dropped"));
+        }
+        Ok(())
+    }
+
+    pub fn retire(&self) {
+        self.retired.store(true, AtomicOrdering::Release);
+    }
+
     pub fn key(&self, granule: usize) -> Vec<Value> {
         self.index.iter().map(|c| c.get(granule)).collect()
     }
 
     pub fn granule_rows(&self, granule: usize) -> u32 {
         self.marks[0][granule].rows
+    }
+}
+
+impl Drop for DataPart {
+    fn drop(&mut self) {
+        if self.retired.load(AtomicOrdering::Acquire)
+            && !self.lease.as_ref().is_some_and(|lease| lease.is_dropped())
+        {
+            if let Err(error) = fs::remove_dir_all(&self.path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(path = ?self.path, %error, "Не удалось удалить устаревший part");
+                }
+            }
+        }
     }
 }
 
@@ -394,6 +427,7 @@ pub(crate) struct PartReader<'a> {
 
 impl<'a> PartReader<'a> {
     pub fn new(part: &'a DataPart, names: &[String]) -> Result<Self> {
+        part.check_live()?;
         let mut columns = Vec::new();
         let mut files = Vec::new();
         for name in names {
@@ -417,6 +451,7 @@ impl<'a> PartReader<'a> {
     }
 
     pub fn read_granule(&mut self, granule: usize) -> Result<Block> {
+        self.part.check_live()?;
         if granule >= self.part.meta.granules as usize {
             return Err(internal("granule is out of bounds"));
         }
