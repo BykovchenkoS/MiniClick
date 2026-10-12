@@ -3,6 +3,7 @@ mod common;
 use common::{block, definition};
 use storage::MergeTreeTable;
 use types::{testing::MemTable, Block, Codec, ColumnData, DbError, ScanRequest, Table};
+use types::{BinaryOp, Expr, Value};
 
 fn read(table: &dyn Table, request: &ScanRequest) -> Vec<Block> {
     table
@@ -148,4 +149,121 @@ fn scan_reads_lazily_and_returns_one_error_before_ending() {
             .sum::<usize>(),
         3
     );
+}
+
+#[test]
+fn pruning_skips_damaged_granules_and_parts_and_explain_matches_scan() {
+    let root = tempfile::tempdir().unwrap();
+    let table = MergeTreeTable::open(&definition(Codec::None), root.path()).unwrap();
+    table
+        .insert(block(&[1, 2, 3, 4, 5, 6], &["a", "b", "c", "d", "e", "f"]))
+        .unwrap();
+    table.insert(block(&[10, 11], &["j", "k"])).unwrap();
+    let path = root.path().join("all_1_1_0/id.bin");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[0] = 255;
+    bytes[50] = 255;
+    std::fs::write(&path, bytes).unwrap();
+    std::fs::remove_file(root.path().join("all_2_2_0/id.bin")).unwrap();
+    let request = ScanRequest {
+        columns: vec!["id".into(), "text".into()],
+        predicate: Some(Expr::binary(
+            BinaryOp::Eq,
+            Expr::col("id"),
+            Expr::lit(Value::Int64(4)),
+        )),
+    };
+    let stats = table.explain_scan(&request).unwrap();
+    assert_eq!(
+        (
+            stats.parts_total,
+            stats.parts_selected,
+            stats.granules_total,
+            stats.granules_selected,
+            stats.rows_total,
+            stats.rows_selected
+        ),
+        (2, 1, 4, 1, 8, 2)
+    );
+    assert_eq!(
+        rows(&read(&table, &request)),
+        [(3, "c".into()), (4, "d".into())]
+    );
+    let mut empty = request;
+    empty.predicate = Some(Expr::binary(
+        BinaryOp::Gt,
+        Expr::col("id"),
+        Expr::lit(Value::Int64(100)),
+    ));
+    assert_eq!(table.explain_scan(&empty).unwrap().parts_selected, 0);
+    assert!(read(&table, &empty).is_empty());
+}
+
+#[test]
+fn pruning_never_loses_matches_at_duplicate_keys_or_inclusive_boundaries() {
+    let root = tempfile::tempdir().unwrap();
+    let table = MergeTreeTable::open(&definition(Codec::Zstd), root.path()).unwrap();
+    table
+        .insert(block(&[1, 2, 2, 2, 3, 4], &["a", "a", "b", "c", "a", "a"]))
+        .unwrap();
+    table.insert(block(&[0, 2, 5], &["a", "d", "a"])).unwrap();
+    let full = rows(&read(
+        &table,
+        &ScanRequest {
+            columns: vec!["id".into(), "text".into()],
+            predicate: None,
+        },
+    ));
+    for bound in -1..=6 {
+        for op in [
+            BinaryOp::Eq,
+            BinaryOp::Lt,
+            BinaryOp::LtEq,
+            BinaryOp::Gt,
+            BinaryOp::GtEq,
+        ] {
+            let matches = |id: i64| match op {
+                BinaryOp::Eq => id == bound,
+                BinaryOp::Lt => id < bound,
+                BinaryOp::LtEq => id <= bound,
+                BinaryOp::Gt => id > bound,
+                BinaryOp::GtEq => id >= bound,
+                _ => unreachable!(),
+            };
+            let request = ScanRequest {
+                columns: vec!["id".into(), "text".into()],
+                predicate: Some(Expr::binary(
+                    op,
+                    Expr::col("id"),
+                    Expr::lit(Value::Int64(bound)),
+                )),
+            };
+            let blocks = read(&table, &request);
+            let actual: Vec<_> = rows(&blocks)
+                .into_iter()
+                .filter(|(id, _)| matches(*id))
+                .collect();
+            let expected: Vec<_> = full
+                .iter()
+                .filter(|(id, _)| matches(*id))
+                .cloned()
+                .collect();
+            assert_eq!(actual, expected, "{op:?} {bound}");
+            let stats = table.explain_scan(&request).unwrap();
+            assert_eq!(blocks.len(), stats.granules_selected);
+            assert_eq!(
+                blocks.iter().map(Block::rows).sum::<usize>() as u64,
+                stats.rows_selected
+            );
+        }
+    }
+    let unsupported = ScanRequest {
+        columns: vec![],
+        predicate: Some(Expr::binary(
+            BinaryOp::Eq,
+            Expr::col("text"),
+            Expr::lit(Value::String("no".into())),
+        )),
+    };
+    assert_eq!(table.explain_scan(&unsupported).unwrap().rows_selected, 9);
 }

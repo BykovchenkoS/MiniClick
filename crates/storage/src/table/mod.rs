@@ -72,6 +72,16 @@ impl Table for MergeTreeTable {
 
     fn scan(&self, request: &ScanRequest) -> Result<BlockStream> {
         let plan = scan::plan(&self.definition, self.repository.snapshot()?, request)?;
+        let stats = plan.stats;
+        tracing::info!(
+            parts_total = stats.parts_total,
+            parts_selected = stats.parts_selected,
+            granules_total = stats.granules_total,
+            granules_selected = stats.granules_selected,
+            rows_total = stats.rows_total,
+            rows_selected = stats.rows_selected,
+            "Выбраны parts и гранулы для сканирования"
+        );
         Ok(ScanStream::into_stream(plan, request.columns.clone()))
     }
 

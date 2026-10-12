@@ -4,7 +4,9 @@ use crate::part::{internal, DataPart, PartReader};
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
-use types::{Block, BlockStream, DbError, Result, ScanRequest, ScanStats, TableDefinition};
+use types::{
+    Block, BlockStream, DbError, Expr, KeyRange, Result, ScanRequest, ScanStats, TableDefinition,
+};
 
 pub(crate) struct SelectedPart {
     pub part: Arc<DataPart>,
@@ -21,6 +23,15 @@ pub(crate) fn plan(
     parts: Vec<Arc<DataPart>>,
     request: &ScanRequest,
 ) -> Result<ScanPlan> {
+    plan_with(definition, parts, request, types::may_match)
+}
+
+pub(crate) fn plan_with(
+    definition: &TableDefinition,
+    parts: Vec<Arc<DataPart>>,
+    request: &ScanRequest,
+    may_match: impl Fn(&Expr, &[String], &KeyRange) -> bool,
+) -> Result<ScanPlan> {
     for (i, name) in request.columns.iter().enumerate() {
         if definition.schema.column(name).is_none() {
             return Err(DbError::UnknownColumn(name.clone()));
@@ -31,7 +42,6 @@ pub(crate) fn plan(
     }
     let mut stats = ScanStats {
         parts_total: parts.len(),
-        parts_selected: parts.len(),
         ..ScanStats::default()
     };
     let mut selected = Vec::new();
@@ -45,13 +55,48 @@ pub(crate) fn plan(
             .rows_total
             .checked_add(part.meta.rows)
             .ok_or_else(|| internal("row count overflow"))?;
-        selected.push(SelectedPart {
-            part,
-            ranges: std::iter::once(0..granules).collect(),
-        });
+        let matches = |range: KeyRange| {
+            request
+                .predicate
+                .as_ref()
+                .is_none_or(|predicate| may_match(predicate, &definition.order_by, &range))
+        };
+        if !matches(KeyRange {
+            min: part.meta.min_key.clone(),
+            max: part.meta.max_key.clone(),
+        }) {
+            continue;
+        }
+        let mut ranges: Vec<Range<usize>> = Vec::new();
+        for granule in 0..granules {
+            let max = if granule + 1 < granules {
+                part.key(granule + 1)
+            } else {
+                part.meta.max_key.clone()
+            };
+            if !matches(KeyRange {
+                min: part.key(granule),
+                max,
+            }) {
+                continue;
+            }
+            stats.granules_selected += 1;
+            stats.rows_selected = stats
+                .rows_selected
+                .checked_add(u64::from(part.granule_rows(granule)))
+                .ok_or_else(|| internal("selected row count overflow"))?;
+            if let Some(range) = ranges.last_mut().filter(|range| range.end == granule) {
+                range.end += 1;
+            } else {
+                ranges.push(granule..granule + 1);
+            }
+        }
+        if !ranges.is_empty() {
+            stats.parts_selected += 1;
+            selected.push(SelectedPart { part, ranges });
+        }
     }
-    stats.granules_selected = stats.granules_total;
-    stats.rows_selected = stats.rows_total;
+
     Ok(ScanPlan {
         parts: selected,
         stats,
@@ -118,3 +163,6 @@ impl Iterator for ScanStream {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
