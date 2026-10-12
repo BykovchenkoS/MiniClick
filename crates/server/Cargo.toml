@@ -1,0 +1,11 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+types = { path = "../types" }
+storage = { path = "../storage" }
+query = { path = "../query" }
+catalog = { path = "../catalog" }
+replication = { path = "../replication" }

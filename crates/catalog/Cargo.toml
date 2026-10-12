@@ -1,0 +1,7 @@
+[package]
+name = "catalog"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+types = { path = "../types" }
