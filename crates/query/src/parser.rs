@@ -29,7 +29,7 @@ pub(crate) fn parse(sql: &str) -> Result<SelectQuery> {
 }
 
 fn translate(query: Query) -> Result<SelectQuery> {
-    // Перечисляем все поля, обновление sqlparser потребует пересмотра адаптера.
+    // Перечисляем все поля, обновление sqlparser потребует пересмотра адаптера
     let Query {
         with,
         body,
@@ -46,7 +46,7 @@ fn translate(query: Query) -> Result<SelectQuery> {
     for (present, name) in [
         (with.is_some(), "WITH"),
         (order_by.is_some(), "ORDER BY"),
-        (limit.is_some() || !limit_by.is_empty(), "LIMIT"),
+        (!limit_by.is_empty(), "LIMIT BY"),
         (offset.is_some(), "OFFSET"),
         (fetch.is_some(), "FETCH"),
         (!locks.is_empty(), "блокировки SELECT"),
@@ -92,7 +92,6 @@ fn translate(query: Query) -> Result<SelectQuery> {
         (into.is_some(), "SELECT INTO"),
         (!lateral_views.is_empty(), "LATERAL VIEW"),
         (prewhere.is_some(), "PREWHERE"),
-        (selection.is_some(), "WHERE"),
         (has_group_by, "GROUP BY"),
         (!cluster_by.is_empty(), "CLUSTER BY"),
         (!distribute_by.is_empty(), "DISTRIBUTE BY"),
@@ -186,7 +185,96 @@ fn translate(query: Query) -> Result<SelectQuery> {
     if projection.is_empty() {
         return Err(DbError::Syntax("пустой список SELECT".into()));
     }
-    Ok(SelectQuery { table, projection })
+    Ok(SelectQuery {
+        table,
+        projection,
+        predicate: selection.map(translate_expr).transpose()?,
+        limit: limit.map(translate_limit).transpose()?,
+    })
+}
+
+// переводим только поддерживаемые выражения
+fn translate_expr(expr: Expr) -> Result<types::Expr> {
+    use sqlparser::ast::{BinaryOperator as B, UnaryOperator as U, Value as V};
+    use types::{BinaryOp as Op, Expr as E, UnaryOp};
+    match expr {
+        Expr::Identifier(id) => Ok(E::Column(id.value)),
+        Expr::Nested(expr) => translate_expr(*expr),
+        Expr::Value(V::SingleQuotedString(text)) => Ok(E::Literal(types::Value::String(text))),
+        Expr::Value(V::Number(text, _)) => Ok(E::Literal(parse_number(&text)?)),
+        Expr::UnaryOp { op: U::Not, expr } => Ok(E::Unary {
+            op: UnaryOp::Not,
+            expr: Box::new(translate_expr(*expr)?),
+        }),
+        Expr::UnaryOp { op: U::Minus, expr } => {
+            // сначала разбираем знак, чтобы принять i64::MIN без переполнения
+            match *expr {
+                Expr::Value(V::Number(text, _)) => {
+                    Ok(E::Literal(parse_number(&format!("-{text}"))?))
+                }
+                _ => Err(unsupported("унарный минус вне числового литерала")),
+            }
+        }
+        Expr::UnaryOp { op: U::Plus, expr } => match *expr {
+            Expr::Value(V::Number(text, _)) => Ok(E::Literal(parse_number(&text)?)),
+            _ => Err(unsupported("унарный плюс вне числового литерала")),
+        },
+        Expr::BinaryOp { left, op, right } => {
+            let op = match op {
+                B::Eq => Op::Eq,
+                B::NotEq => Op::NotEq,
+                B::Lt => Op::Lt,
+                B::LtEq => Op::LtEq,
+                B::Gt => Op::Gt,
+                B::GtEq => Op::GtEq,
+                B::And => Op::And,
+                B::Or => Op::Or,
+                _ => {
+                    return Err(unsupported(
+                        "оператор WHERE (арифметика будет добавлена отдельно)",
+                    ))
+                }
+            };
+            Ok(E::binary(
+                op,
+                translate_expr(*left)?,
+                translate_expr(*right)?,
+            ))
+        }
+        _ => Err(unsupported(
+            "выражение WHERE: NULL, IN, LIKE, функция или другая конструкция",
+        )),
+    }
+}
+
+fn parse_number(text: &str) -> Result<types::Value> {
+    use types::Value;
+    let bad =
+        || DbError::TypeMismatch(format!("число '{text}' выходит за поддерживаемый диапазон"));
+    if text.contains(['.', 'e', 'E']) {
+        let x: f64 = text.parse().map_err(|_| bad())?;
+        if !x.is_finite() {
+            return Err(bad());
+        }
+        Ok(Value::Float64(x))
+    } else if let Ok(x) = text.parse::<i64>() {
+        Ok(Value::Int64(x))
+    } else {
+        text.parse::<u64>().map(Value::UInt64).map_err(|_| bad())
+    }
+}
+
+fn translate_limit(expr: Expr) -> Result<u64> {
+    if let Expr::Value(sqlparser::ast::Value::Number(text, _)) = expr {
+        if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
+            return text
+                .parse()
+                .map_err(|_| DbError::Syntax("LIMIT превышает UInt64".into()));
+        }
+    }
+    Err(DbError::Syntax(
+        "LIMIT должен быть неотрицательным целым литералом".into(),
+    ))
 }
 
 #[cfg(test)]
@@ -199,6 +287,8 @@ mod tests {
             parse("SELECT name AS label, id FROM events;").unwrap(),
             SelectQuery {
                 table: "events".into(),
+                predicate: None,
+                limit: None,
                 projection: vec![
                     SelectItem::Column {
                         name: "name".into(),
@@ -219,6 +309,8 @@ mod tests {
             parse("select `User ID` from `Events`;").unwrap(),
             SelectQuery {
                 table: "Events".into(),
+                predicate: None,
+                limit: None,
                 projection: vec![SelectItem::Column {
                     name: "User ID".into(),
                     alias: None
@@ -233,6 +325,8 @@ mod tests {
             parse("-- demo\nsElEcT /* comment */ * FrOm events;").unwrap(),
             SelectQuery {
                 table: "events".into(),
+                predicate: None,
+                limit: None,
                 projection: vec![SelectItem::Wildcard]
             }
         );
@@ -253,9 +347,7 @@ mod tests {
     #[test]
     fn rejects_unsupported_ast_without_ignoring_clauses() {
         for sql in [
-            "SELECT * FROM events WHERE id = 1",
             "SELECT * FROM events PREWHERE id = 1",
-            "SELECT * FROM events LIMIT 1",
             "SELECT * FROM events ORDER BY id",
             "SELECT DISTINCT id FROM events",
             "SELECT id FROM events GROUP BY id",

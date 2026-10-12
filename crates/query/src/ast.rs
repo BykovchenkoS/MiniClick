@@ -1,9 +1,10 @@
 /// наше представление SELECT, не зависящее от sqlparser
-
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct SelectQuery {
     pub table: String,
     pub projection: Vec<SelectItem>,
+    pub predicate: Option<types::Expr>,
+    pub limit: Option<u64>,
 }
 
 #[derive(Debug, PartialEq, Eq)]

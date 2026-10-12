@@ -1,16 +1,76 @@
-use crate::plan::QueryPlan;
-use types::{Block, Column, DbError, QueryOutput, Result};
+use crate::plan::{ProjectionColumn, QueryPlan};
+use types::{Block, BlockStream, Column, DbError, Expr, QueryOutput, Result};
 
 pub(crate) fn execute(plan: QueryPlan) -> Result<QueryOutput> {
+    // Схема и WHERE уже проверены планировщиком, но scan для LIMIT 0 не нужен
+    if plan.limit == Some(0) {
+        return Ok(QueryOutput::Rows {
+            header: plan.header,
+            stream: Box::new(std::iter::empty()),
+        });
+    }
     let input = plan.table.scan(&plan.scan)?;
-    let projection = plan.projection;
+    Ok(QueryOutput::Rows {
+        header: plan.header,
+        stream: Box::new(SelectStream {
+            input,
+            projection: plan.projection,
+            predicate: plan.scan.predicate,
+            remaining: plan.limit,
+            done: false,
+        }),
+    })
+}
 
-    // map не собирает весь результат, обрабатывается один входной блок за раз
-    // ошибки чтения остаются элементами потока Result<Block>
+struct SelectStream {
+    input: BlockStream,
+    projection: Vec<ProjectionColumn>,
+    predicate: Option<Expr>,
+    remaining: Option<u64>,
+    done: bool,
+}
 
-    let stream = input.map(move |item| {
-        let block = item?;
-        let columns = projection
+impl Iterator for SelectStream {
+    type Item = Result<Block>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done || self.remaining == Some(0) {
+            return None;
+        }
+        let item = match self.input.next() {
+            Some(item) => item,
+            None => {
+                self.done = true;
+                return None;
+            }
+        };
+        let result = item.and_then(|block| self.process(block));
+        // После ошибки не выдаём частичный остаток результата
+        if result.is_err() {
+            self.done = true;
+        }
+        Some(result)
+    }
+}
+
+impl std::iter::FusedIterator for SelectStream {}
+
+impl SelectStream {
+    fn process(&mut self, block: Block) -> Result<Block> {
+        let mut block = match &self.predicate {
+            Some(predicate) => crate::expr::filter(&block, predicate)?,
+            None => block,
+        };
+        // LIMIT считает подходящие строки, а не исходные строки или блоки
+        if let Some(remaining) = &mut self.remaining {
+            let keep = (*remaining).min(block.rows() as u64) as usize;
+            if keep < block.rows() {
+                block = block.slice(0, keep);
+            }
+            *remaining -= keep as u64;
+        }
+        let columns = self
+            .projection
             .iter()
             .map(|column| {
                 let data = block.column(&column.source).ok_or_else(|| {
@@ -26,10 +86,5 @@ pub(crate) fn execute(plan: QueryPlan) -> Result<QueryOutput> {
             })
             .collect::<Result<Vec<_>>>()?;
         Block::with_rows(columns, block.rows())
-    });
-
-    Ok(QueryOutput::Rows {
-        header: plan.header,
-        stream: Box::new(stream),
-    })
+    }
 }

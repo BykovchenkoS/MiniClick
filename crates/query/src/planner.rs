@@ -46,13 +46,22 @@ pub(crate) fn plan(query: SelectQuery, catalog: &dyn Catalog) -> Result<QueryPla
             data_type: definition.data_type,
         });
     }
+    let predicate = query
+        .predicate
+        .map(|predicate| crate::expr::bind_predicate(predicate, schema))
+        .transpose()?;
+    if let Some(predicate) = &predicate {
+        for name in predicate.columns() {
+            if !columns.contains(&name) {
+                columns.push(name);
+            }
+        }
+    }
     Ok(QueryPlan {
         table,
-        scan: ScanRequest {
-            columns,
-            predicate: None,
-        },
+        scan: ScanRequest { columns, predicate },
         projection,
         header,
+        limit: query.limit,
     })
 }

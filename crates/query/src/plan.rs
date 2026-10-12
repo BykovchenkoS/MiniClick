@@ -7,6 +7,7 @@ pub(crate) struct QueryPlan {
     pub scan: ScanRequest,
     pub projection: Vec<ProjectionColumn>,
     pub header: Vec<ColumnDef>,
+    pub limit: Option<u64>,
 }
 
 pub(crate) struct ProjectionColumn {
