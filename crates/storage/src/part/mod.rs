@@ -2,9 +2,9 @@
 
 use std::cmp::Ordering;
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use types::{Block, ColumnData, DbError, Engine, Result, TableDefinition, Value};
+use types::{Block, Column, ColumnData, DbError, Engine, Result, TableDefinition, Value};
 
 use crate::format::{self, Mark, PartMeta, FORMAT_VERSION};
 
@@ -283,6 +283,204 @@ pub(crate) fn write_part(
         ))?;
     }
     writer.finish()
+}
+
+/// Метаданные и индекс находятся в памяти; колонки открываются при чтении.
+pub(crate) struct DataPart {
+    pub path: PathBuf,
+    pub meta: PartMeta,
+    pub marks: Vec<Vec<Mark>>,
+    pub index: Vec<ColumnData>,
+}
+
+impl DataPart {
+    pub fn open(path: &Path, definition: &TableDefinition) -> Result<Self> {
+        validate_definition(definition)?;
+        let meta = format::decode_meta(&fs::read(path.join("part.json"))?)?;
+        if meta.columns != definition.schema.columns {
+            return Err(internal("part schema differs from table schema"));
+        }
+        let mut marks: Vec<Vec<Mark>> = Vec::new();
+        for column in &meta.columns {
+            let column_marks =
+                format::decode_marks(&fs::read(path.join(format!("{}.mrk", column.name)))?)?;
+            if column_marks.len() != meta.granules as usize
+                || column_marks.iter().map(|m| u64::from(m.rows)).sum::<u64>() != meta.rows
+            {
+                return Err(internal("marks differ from metadata counts"));
+            }
+            for (i, mark) in column_marks.iter().enumerate() {
+                if mark.rows as usize > definition.settings.index_granularity
+                    || (i + 1 < column_marks.len()
+                        && mark.rows as usize != definition.settings.index_granularity)
+                {
+                    return Err(internal("invalid granule size"));
+                }
+            }
+            if let Some(first) = marks.first() {
+                if first
+                    .iter()
+                    .map(|m| m.rows)
+                    .ne(column_marks.iter().map(|m| m.rows))
+                {
+                    return Err(internal("column granule counts differ"));
+                }
+            }
+            marks.push(column_marks);
+        }
+        let key_types = definition
+            .order_by
+            .iter()
+            .map(|name| {
+                definition
+                    .schema
+                    .column(name)
+                    .map(|c| c.data_type)
+                    .ok_or_else(|| DbError::UnknownColumn(name.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if meta.min_key.len() != key_types.len()
+            || meta
+                .min_key
+                .iter()
+                .zip(&key_types)
+                .any(|(v, t)| v.data_type() != *t)
+        {
+            return Err(internal("part key differs from table key"));
+        }
+        let index = format::decode_index(
+            &fs::read(path.join("primary.idx"))?,
+            &key_types,
+            meta.granules as usize,
+        )?;
+        let part = Self {
+            path: path.to_owned(),
+            meta,
+            marks,
+            index,
+        };
+        if compare_keys(&part.key(0), &part.meta.min_key)? != Ordering::Equal {
+            return Err(internal("first index key differs from minimum"));
+        }
+        for granule in 0..part.meta.granules as usize {
+            let key = part.key(granule);
+            let upper = if granule + 1 < part.meta.granules as usize {
+                part.key(granule + 1)
+            } else {
+                part.meta.max_key.clone()
+            };
+            if compare_keys(&key, &upper)? == Ordering::Greater {
+                return Err(internal("index keys are not sorted"));
+            }
+        }
+        Ok(part)
+    }
+
+    pub fn key(&self, granule: usize) -> Vec<Value> {
+        self.index.iter().map(|c| c.get(granule)).collect()
+    }
+
+    pub fn granule_rows(&self, granule: usize) -> u32 {
+        self.marks[0][granule].rows
+    }
+}
+
+/// Файлы сохраняются между чтениями гранул; чтение начинается по меткам.
+pub(crate) struct PartReader<'a> {
+    part: &'a DataPart,
+    columns: Vec<usize>,
+    files: Vec<File>,
+}
+
+impl<'a> PartReader<'a> {
+    pub fn new(part: &'a DataPart, names: &[String]) -> Result<Self> {
+        let mut columns = Vec::new();
+        let mut files = Vec::new();
+        for name in names {
+            let position = part
+                .meta
+                .columns
+                .iter()
+                .position(|c| &c.name == name)
+                .ok_or_else(|| DbError::UnknownColumn(name.clone()))?;
+            if columns.contains(&position) {
+                return Err(internal("duplicate scan column"));
+            }
+            columns.push(position);
+            files.push(File::open(part.path.join(format!("{name}.bin")))?);
+        }
+        Ok(Self {
+            part,
+            columns,
+            files,
+        })
+    }
+
+    pub fn read_granule(&mut self, granule: usize) -> Result<Block> {
+        if granule >= self.part.meta.granules as usize {
+            return Err(internal("granule is out of bounds"));
+        }
+        let mut columns = Vec::new();
+        for (&position, file) in self.columns.iter().zip(&mut self.files) {
+            let marks = &self.part.marks[position];
+            let mark = marks[granule];
+            let end = if let Some(next) = marks.get(granule + 1) {
+                next.offset
+            } else {
+                file.metadata()?.len()
+            };
+            let size = end
+                .checked_sub(mark.offset)
+                .ok_or_else(|| internal("mark exceeds column size"))?;
+            let max_size = format::MAX_FRAME_SIZE
+                + format::MAX_FRAME_SIZE / 255
+                + 1024
+                + format::FRAME_HEADER_SIZE;
+            if size < format::FRAME_HEADER_SIZE as u64 || size > max_size as u64 {
+                return Err(internal("invalid frame range"));
+            }
+            if mark.offset != file.stream_position()? {
+                file.seek(SeekFrom::Start(mark.offset))?;
+            }
+            let mut header = [0; format::FRAME_HEADER_SIZE];
+            read_exact(file, &mut header)?;
+            let compressed = u32::from_le_bytes(
+                header[1..5]
+                    .try_into()
+                    .map_err(|_| internal("invalid header"))?,
+            ) as u64;
+            if compressed + format::FRAME_HEADER_SIZE as u64 != size {
+                return Err(internal("frame header differs from marks"));
+            }
+            let mut frame = Vec::new();
+            frame
+                .try_reserve_exact(size as usize)
+                .map_err(|_| internal("frame allocation failed"))?;
+            frame.extend_from_slice(&header);
+            frame.resize(size as usize, 0);
+            read_exact(file, &mut frame[format::FRAME_HEADER_SIZE..])?;
+            let definition = &self.part.meta.columns[position];
+            columns.push(Column {
+                name: definition.name.clone(),
+                data: format::decode_column(
+                    &format::decode_frame(&frame)?,
+                    definition.data_type,
+                    mark.rows as usize,
+                )?,
+            });
+        }
+        Block::with_rows(columns, self.part.granule_rows(granule) as usize)
+    }
+}
+
+fn read_exact(file: &mut File, bytes: &mut [u8]) -> Result<()> {
+    file.read_exact(bytes).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            internal("truncated column file")
+        } else {
+            DbError::Io(e)
+        }
+    })
 }
 
 #[cfg(test)]
