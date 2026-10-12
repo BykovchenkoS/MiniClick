@@ -1,9 +1,10 @@
 //! Выполнение SQL через общие интерфейсы Catalog и Table.
 //!
-//! SELECT из одной таблицы, псевдонимы AS, WHERE и LIMIT.
+//! SELECT, WHERE, LIMIT и команды CREATE / DROP / OPTIMIZE TABLE.
 //! Типы sqlparser остаются внутри parser и не пересекают границы крейта.
 
 mod ast;
+mod ddl;
 mod engine;
 mod executor;
 mod expr;

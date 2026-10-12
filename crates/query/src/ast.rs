@@ -1,4 +1,4 @@
-/// наше представление SELECT, не зависящее от sqlparser
+/// Наше представление SELECT, не зависящее от sqlparser.
 #[derive(Debug, PartialEq)]
 pub(crate) struct SelectQuery {
     pub table: String,
@@ -11,4 +11,21 @@ pub(crate) struct SelectQuery {
 pub(crate) enum SelectItem {
     Wildcard,
     Column { name: String, alias: Option<String> },
+}
+
+/// Внутренний результат перевода SQL. Не является общим интерфейсом проекта.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Command {
+    Select(SelectQuery),
+    Create {
+        definition: types::TableDefinition,
+        if_not_exists: bool,
+    },
+    Drop {
+        name: String,
+        if_exists: bool,
+    },
+    Optimize {
+        name: String,
+    },
 }

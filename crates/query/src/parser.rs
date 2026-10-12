@@ -6,30 +6,98 @@ use sqlparser::dialect::ClickHouseDialect;
 use sqlparser::parser::Parser;
 use types::{DbError, Result};
 
-use crate::ast::{SelectItem, SelectQuery};
+use crate::ast::{Command, SelectItem, SelectQuery};
+use sqlparser::{keywords::Keyword, tokenizer::Token};
 
 fn unsupported(feature: &str) -> DbError {
     DbError::Unsupported(format!("Query: {feature} пока не поддерживается"))
 }
 
-pub(crate) fn parse(sql: &str) -> Result<SelectQuery> {
-    let mut statements = Parser::parse_sql(&ClickHouseDialect {}, sql)
-        .map_err(|e| DbError::Syntax(e.to_string()))?;
-    if statements.is_empty() {
+pub(crate) fn parse(sql: &str) -> Result<Command> {
+    let dialect = ClickHouseDialect {};
+    let mut parser = Parser::new(&dialect).try_with_sql(sql).map_err(syntax)?;
+    while parser.consume_token(&Token::SemiColon) {}
+    if parser.peek_token().token == Token::EOF {
         return Err(DbError::Syntax("пустой SQL-запрос".into()));
     }
-    if statements.len() != 1 {
-        return Err(unsupported("несколько SQL-команд за один вызов"));
-    }
-    let statement = statements.remove(0);
-    let Statement::Query(query) = statement else {
-        return Err(unsupported("команда, отличная от SELECT"));
+    let statement = parser.parse_statement().map_err(syntax)?;
+    // В sqlparser 0.53 CREATE не включает SETTINGS: разбираем только этот
+    // хвост токенами библиотеки, не разделяем исходный SQL по строкам/пробелам.
+    let settings = if matches!(statement, Statement::CreateTable(_))
+        && parser.parse_keyword(Keyword::SETTINGS)
+    {
+        crate::ddl::parse_settings(&mut parser)?
+    } else {
+        types::TableSettings::default()
     };
-    translate(*query)
+    let terminated = parser.consume_token(&Token::SemiColon);
+    while parser.consume_token(&Token::SemiColon) {}
+    if parser.peek_token().token != Token::EOF {
+        return Err(if terminated {
+            unsupported("несколько SQL-команд за один вызов")
+        } else {
+            DbError::Syntax(format!(
+                "неожиданное продолжение SQL: {}",
+                parser.peek_token()
+            ))
+        });
+    }
+    match statement {
+        Statement::Query(query) => Ok(Command::Select(translate(*query)?)),
+        Statement::CreateTable(create) => crate::ddl::create(create, settings),
+        Statement::Drop {
+            object_type,
+            if_exists,
+            names,
+            cascade,
+            restrict,
+            purge,
+            temporary,
+        } => {
+            if object_type != sqlparser::ast::ObjectType::Table
+                || cascade
+                || restrict
+                || purge
+                || temporary
+            {
+                return Err(unsupported("вариант DROP"));
+            }
+            if names.len() != 1 {
+                return Err(unsupported("удаление нескольких таблиц за один вызов"));
+            }
+            Ok(Command::Drop {
+                name: crate::ddl::table_name(names.into_iter().next().expect("одно имя"))?,
+                if_exists,
+            })
+        }
+        Statement::OptimizeTable {
+            name,
+            on_cluster,
+            partition,
+            include_final,
+            deduplicate,
+        } => {
+            if on_cluster.is_some() || partition.is_some() || include_final || deduplicate.is_some()
+            {
+                return Err(unsupported(
+                    "опция OPTIMIZE (ON CLUSTER / PARTITION / FINAL / DEDUPLICATE)",
+                ));
+            }
+            Ok(Command::Optimize {
+                name: crate::ddl::table_name(name)?,
+            })
+        }
+        _ => Err(unsupported("SQL-команда")),
+    }
+}
+
+pub(crate) fn syntax(error: sqlparser::parser::ParserError) -> DbError {
+    DbError::Syntax(error.to_string())
 }
 
 fn translate(query: Query) -> Result<SelectQuery> {
-    // Перечисляем все поля, обновление sqlparser потребует пересмотра адаптера
+    // Перечисляем ВСЕ поля: обновление sqlparser потребует пересмотра адаптера.
+    // Нельзя молча проигнорировать часть запроса и вернуть неверные данные.
     let Query {
         with,
         body,
@@ -194,7 +262,7 @@ fn translate(query: Query) -> Result<SelectQuery> {
     })
 }
 
-// переводим только поддерживаемые выражения
+// Переводим только поддерживаемые выражения; типы проверит планировщик.
 fn translate_expr(expr: Expr) -> Result<types::Expr> {
     use sqlparser::ast::{BinaryOperator as B, UnaryOperator as U, Value as V};
     use types::{BinaryOp as Op, Expr as E, UnaryOp};
@@ -208,7 +276,7 @@ fn translate_expr(expr: Expr) -> Result<types::Expr> {
             expr: Box::new(translate_expr(*expr)?),
         }),
         Expr::UnaryOp { op: U::Minus, expr } => {
-            // сначала разбираем знак, чтобы принять i64::MIN без переполнения
+            // Сначала разбираем знак, чтобы принять i64::MIN без переполнения.
             match *expr {
                 Expr::Value(V::Number(text, _)) => {
                     Ok(E::Literal(parse_number(&format!("-{text}"))?))
@@ -281,6 +349,14 @@ fn translate_limit(expr: Expr) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Существующие тесты SELECT продолжают проверять его собственное AST.
+    fn parse(sql: &str) -> Result<SelectQuery> {
+        match super::parse(sql)? {
+            Command::Select(query) => Ok(query),
+            _ => Err(unsupported("не SELECT")),
+        }
+    }
 
     #[test]
     fn translates_into_own_ast() {
