@@ -12,6 +12,7 @@ mod part;
 #[cfg(test)]
 mod test_support;
 
-// Репозиторий подключается к таблице в следующем этапе.
-#[allow(dead_code)]
 mod repository;
+mod table;
+
+pub use table::{MergeTreeFactory, MergeTreeTable};
