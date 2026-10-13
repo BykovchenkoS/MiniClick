@@ -21,8 +21,7 @@ pub(crate) fn parse(sql: &str) -> Result<Command> {
         return Err(DbError::Syntax("пустой SQL-запрос".into()));
     }
     let statement = parser.parse_statement().map_err(syntax)?;
-    // В sqlparser 0.53 CREATE не включает SETTINGS: разбираем только этот
-    // хвост токенами библиотеки, не разделяем исходный SQL по строкам/пробелам.
+
     let settings = if matches!(statement, Statement::CreateTable(_))
         && parser.parse_keyword(Keyword::SETTINGS)
     {
@@ -96,8 +95,6 @@ pub(crate) fn syntax(error: sqlparser::parser::ParserError) -> DbError {
 }
 
 fn translate(query: Query) -> Result<SelectQuery> {
-    // Перечисляем ВСЕ поля: обновление sqlparser потребует пересмотра адаптера.
-    // Нельзя молча проигнорировать часть запроса и вернуть неверные данные.
     let Query {
         with,
         body,
@@ -151,16 +148,22 @@ fn translate(query: Query) -> Result<SelectQuery> {
         value_table_mode,
         connect_by,
     } = *select;
-    let has_group_by = !matches!(group_by,
-        GroupByExpr::Expressions(ref exprs, ref modifiers)
-            if exprs.is_empty() && modifiers.is_empty());
+    let group_by = match group_by {
+        GroupByExpr::Expressions(exprs, modifiers) if modifiers.is_empty() => exprs
+            .into_iter()
+            .map(|expr| match expr {
+                Expr::Identifier(id) => Ok(id.value),
+                _ => Err(unsupported("GROUP BY поддерживает только имена колонок")),
+            })
+            .collect::<Result<Vec<_>>>()?,
+        _ => return Err(unsupported("GROUP BY ALL, ROLLUP, CUBE и модификаторы")),
+    };
     for (present, name) in [
         (distinct.is_some(), "DISTINCT"),
         (top.is_some(), "TOP"),
         (into.is_some(), "SELECT INTO"),
         (!lateral_views.is_empty(), "LATERAL VIEW"),
         (prewhere.is_some(), "PREWHERE"),
-        (has_group_by, "GROUP BY"),
         (!cluster_by.is_empty(), "CLUSTER BY"),
         (!distribute_by.is_empty(), "DISTRIBUTE BY"),
         (!sort_by.is_empty(), "SORT BY"),
@@ -270,13 +273,14 @@ fn translate(query: Query) -> Result<SelectQuery> {
     }
     Ok(SelectQuery {
         table,
+        group_by,
         projection,
         predicate: selection.map(translate_expr).transpose()?,
         limit: limit.map(translate_limit).transpose()?,
     })
 }
 
-// Переводим только поддерживаемые выражения; типы проверит планировщик.
+// Переводим только поддерживаемые выражения, типы проверит планировщик.
 fn translate_expr(expr: Expr) -> Result<types::Expr> {
     use sqlparser::ast::{BinaryOperator as B, UnaryOperator as U, Value as V};
     use types::{BinaryOp as Op, Expr as E, UnaryOp};
@@ -291,7 +295,6 @@ fn translate_expr(expr: Expr) -> Result<types::Expr> {
             expr: Box::new(translate_expr(*expr)?),
         }),
         Expr::UnaryOp { op: U::Minus, expr } => {
-            // Сначала разбираем знак, чтобы принять i64::MIN без переполнения.
             match *expr {
                 Expr::Value(V::Number(text, _)) => {
                     Ok(E::Literal(parse_number(&format!("-{text}"))?))
@@ -423,8 +426,7 @@ fn translate_function(function: sqlparser::ast::Function) -> Result<types::Expr>
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Существующие тесты SELECT продолжают проверять его собственное AST.
+    
     fn parse(sql: &str) -> Result<SelectQuery> {
         match super::parse(sql)? {
             Command::Select(query) => Ok(query),
@@ -437,6 +439,7 @@ mod tests {
         assert_eq!(
             parse("SELECT name AS label, id FROM events;").unwrap(),
             SelectQuery {
+                group_by: vec![],
                 table: "events".into(),
                 predicate: None,
                 limit: None,
@@ -459,6 +462,7 @@ mod tests {
         assert_eq!(
             parse("select `User ID` from `Events`;").unwrap(),
             SelectQuery {
+                group_by: vec![],
                 table: "Events".into(),
                 predicate: None,
                 limit: None,
@@ -475,6 +479,7 @@ mod tests {
         assert_eq!(
             parse("-- demo\nsElEcT /* comment */ * FrOm events;").unwrap(),
             SelectQuery {
+                group_by: vec![],
                 table: "events".into(),
                 predicate: None,
                 limit: None,
@@ -501,7 +506,6 @@ mod tests {
             "SELECT * FROM events PREWHERE id = 1",
             "SELECT * FROM events ORDER BY id",
             "SELECT DISTINCT id FROM events",
-            "SELECT id FROM events GROUP BY id",
             "SELECT 1",
             "SELECT * FROM events, other",
             "SELECT * FROM events JOIN other ON events.id = other.id",

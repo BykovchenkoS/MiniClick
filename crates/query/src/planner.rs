@@ -1,11 +1,22 @@
 use crate::ast::{SelectItem, SelectQuery};
-use crate::plan::{ProjectionColumn, QueryPlan};
+use crate::plan::{GroupOutput, GroupPlan, ProjectionColumn, QueryPlan};
 use std::collections::HashSet;
 use types::{Catalog, ColumnDef, DbError, Expr, Result, ScanRequest};
 
 pub(crate) fn plan(query: SelectQuery, catalog: &dyn Catalog) -> Result<QueryPlan> {
     let table = catalog.get_table(&query.table)?;
     let schema = &table.definition().schema;
+    let mut keys = Vec::new();
+    for name in query.group_by {
+        let column = schema
+            .column(&name)
+            .ok_or_else(|| DbError::UnknownColumn(name.clone()))?;
+        if !keys.iter().any(|c: &ColumnDef| c.name == name) {
+            keys.push(column.clone());
+        }
+    }
+    let grouped = !keys.is_empty();
+    let mut group_outputs = Vec::new();
     let mut expressions = Vec::new();
     for item in query.projection {
         match item {
@@ -32,9 +43,22 @@ pub(crate) fn plan(query: SelectQuery, catalog: &dyn Catalog) -> Result<QueryPla
     let mut header = Vec::new();
     let mut projection = Vec::new();
     for (expr, output) in expressions {
-        let (expr, data_type) = if is_aggregate {
+        let (expr, data_type) = if grouped && !matches!(&expr, Expr::Function { .. }) {
+            let (expr, data_type) = crate::expr::bind_scalar(expr, schema)?;
+            let Expr::Column(name) = &expr else {
+                return Err(DbError::Unsupported(
+                    "SELECT с GROUP BY: ожидается ключ группы или агрегат".into(),
+                ));
+            };
+            let index = keys.iter().position(|c| &c.name == name).ok_or_else(|| {
+                DbError::Unsupported(format!("колонка '{name}' не входит в GROUP BY"))
+            })?;
+            group_outputs.push(GroupOutput::Key(index));
+            (expr, data_type)
+        } else if is_aggregate || grouped {
             let spec = crate::aggregate::AggregateSpec::bind(expr.clone(), schema)?;
             let data_type = spec.data_type;
+            group_outputs.push(GroupOutput::Aggregate(aggregates.len()));
             aggregates.push(spec);
             (expr, data_type)
         } else {
@@ -60,6 +84,11 @@ pub(crate) fn plan(query: SelectQuery, catalog: &dyn Catalog) -> Result<QueryPla
             output,
         });
     }
+    for key in &keys {
+        if !columns.contains(&key.name) {
+            columns.push(key.name.clone());
+        }
+    }
     let predicate = query
         .predicate
         .map(|p| crate::expr::bind_predicate(p, schema))
@@ -77,6 +106,10 @@ pub(crate) fn plan(query: SelectQuery, catalog: &dyn Catalog) -> Result<QueryPla
         projection,
         header,
         limit: query.limit,
-        aggregates: is_aggregate.then_some(aggregates),
+        aggregates: (is_aggregate || grouped).then_some(aggregates),
+        grouping: grouped.then_some(GroupPlan {
+            keys,
+            outputs: group_outputs,
+        }),
     })
 }

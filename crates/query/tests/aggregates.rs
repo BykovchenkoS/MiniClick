@@ -89,7 +89,7 @@ fn engine(blocks: Vec<Block>) -> SqlQueryEngine {
     SqlQueryEngine::new(catalog)
 }
 
-// Таблица намеренно игнорирует predicate: проверяем точную фильтрацию в Query.
+// Таблица намеренно игнорирует predicate, проверяем точную фильтрацию в Query
 struct SpyTable {
     definition: TableDefinition,
     request: Mutex<Option<ScanRequest>>,
@@ -113,7 +113,7 @@ impl Table for SpyTable {
         input.push(Err(DbError::Io(std::io::Error::other(
             "ошибка следующего блока",
         ))));
-        // После ошибки есть ещё данные: исполнитель должен остановиться на ошибке.
+
         input.push(Ok(fixture().select(&req.columns)?));
         let reads = self.reads.clone();
         Ok(Box::new(input.into_iter().inspect(move |_| {
@@ -320,7 +320,6 @@ fn unsupported_function_modifiers_are_not_silently_ignored() {
         "SELECT db.sum(value) FROM events",
         "SELECT count(events.*) FROM events",
         "SELECT sum(1)(value) FROM events",
-        "SELECT count() FROM events GROUP BY id",
     ] {
         assert!(e.execute(sql).is_err(), "{sql}");
     }

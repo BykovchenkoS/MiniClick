@@ -191,3 +191,110 @@ pub(crate) fn execute(
         .collect::<Result<Vec<_>>>()?;
     Block::with_rows(columns, 1)
 }
+
+#[derive(Hash, PartialEq, Eq)]
+enum KeyValue {
+    Int(i64),
+    UInt(u64),
+    Float(u64),
+    Text(String),
+    Date(i32),
+    DateTime(i64),
+}
+impl From<&Value> for KeyValue {
+    fn from(value: &Value) -> Self {
+        match value {
+            Value::Int64(v) => Self::Int(*v),
+            Value::UInt64(v) => Self::UInt(*v),
+            Value::Float64(v) => Self::Float(v.to_bits()),
+            Value::String(v) => Self::Text(v.clone()),
+            Value::Date(v) => Self::Date(*v),
+            Value::DateTime(v) => Self::DateTime(*v),
+        }
+    }
+}
+
+pub(crate) fn execute_grouped(
+    input: BlockStream,
+    specs: &[AggregateSpec],
+    predicate: Option<&Expr>,
+    header: &[ColumnDef],
+    grouping: &crate::plan::GroupPlan,
+    limit: Option<u64>,
+) -> Result<Block> {
+    use crate::plan::GroupOutput;
+    use std::collections::HashMap;
+    let mut lookup: HashMap<Vec<KeyValue>, usize> = HashMap::new();
+    let mut groups: Vec<(Vec<Value>, Vec<State>)> = Vec::new();
+    for block in input {
+        let block = block?;
+        let block = match predicate {
+            Some(p) => crate::expr::filter(&block, p)?,
+            None => block,
+        };
+        let key_columns = grouping
+            .keys
+            .iter()
+            .map(|def| {
+                block
+                    .column(&def.name)
+                    .ok_or_else(|| DbError::Internal(format!("scan не вернул ключ '{}'", def.name)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Вычисляем аргументы по колонкам один раз на блок, а не отдельно для каждой группы
+        let arguments = specs
+            .iter()
+            .map(|spec| {
+                spec.argument
+                    .as_ref()
+                    .map(|(expr, t)| crate::expr::project(&block, expr, *t))
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for row in 0..block.rows() {
+            let key: Vec<_> = key_columns.iter().map(|column| column.get(row)).collect();
+            let hash_key: Vec<_> = key.iter().map(KeyValue::from).collect();
+            let index = *lookup.entry(hash_key).or_insert_with(|| {
+                let index = groups.len();
+                groups.push((key, specs.iter().map(AggregateSpec::empty).collect()));
+                index
+            });
+            for (state, argument) in groups[index].1.iter_mut().zip(&arguments) {
+                if state.kind == Kind::Count {
+                    if let Value::UInt64(count) = &mut state.value {
+                        *count = count
+                            .checked_add(1)
+                            .ok_or_else(|| DbError::TypeMismatch("переполнение count".into()))?;
+                    }
+                } else if let Some(argument) = argument {
+                    state.accept(argument.get(row))?;
+                }
+            }
+        }
+    }
+    // Сначала дочитываем и завершаем все группы. LIMIT ограничивает только выдачу
+    let rows = limit.map_or(groups.len(), |limit| {
+        limit.min(groups.len() as u64) as usize
+    });
+
+    let mut columns: Vec<_> = header
+        .iter()
+        .map(|def| Column {
+            name: def.name.clone(),
+            data: ColumnData::empty(def.data_type),
+        })
+        .collect();
+
+    for (key, states) in groups.into_iter().take(rows) {
+        let values: Vec<_> = states.into_iter().map(State::finish).collect();
+        for (column, output) in columns.iter_mut().zip(&grouping.outputs) {
+            let value = match output {
+                GroupOutput::Key(i) => &key[*i],
+                GroupOutput::Aggregate(i) => &values[*i],
+            };
+            column.data.push(value.clone())?;
+        }
+    }
+    Block::with_rows(columns, rows)
+}

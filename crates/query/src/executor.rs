@@ -2,7 +2,6 @@ use crate::plan::{ProjectionColumn, QueryPlan};
 use types::{Block, BlockStream, Column, Expr, QueryOutput, Result};
 
 pub(crate) fn execute(plan: QueryPlan) -> Result<QueryOutput> {
-    // Схема и WHERE уже проверены планировщиком, но scan для LIMIT 0 не нужен.
     if plan.limit == Some(0) {
         return Ok(QueryOutput::Rows {
             header: plan.header,
@@ -12,11 +11,28 @@ pub(crate) fn execute(plan: QueryPlan) -> Result<QueryOutput> {
     let input = plan.table.scan(&plan.scan)?;
     if let Some(specs) = plan.aggregates {
         let header = plan.header.clone();
-        let mut pending = Some((input, specs, plan.scan.predicate, header));
+        let mut pending = Some((
+            input,
+            specs,
+            plan.scan.predicate,
+            header,
+            plan.grouping,
+            plan.limit,
+        ));
         return Ok(QueryOutput::Rows {
             header: plan.header,
             stream: Box::new(std::iter::from_fn(move || {
-                let (input, specs, predicate, header) = pending.take()?;
+                let (input, specs, predicate, header, grouping, limit) = pending.take()?;
+                if let Some(grouping) = grouping {
+                    return Some(crate::aggregate::execute_grouped(
+                        input,
+                        &specs,
+                        predicate.as_ref(),
+                        &header,
+                        &grouping,
+                        limit,
+                    ));
+                }
                 Some(crate::aggregate::execute(
                     input,
                     &specs,
@@ -61,7 +77,8 @@ impl Iterator for SelectStream {
             }
         };
         let result = item.and_then(|block| self.process(block));
-        // После ошибки не выдаём частичный остаток результата.
+        
+        // После ошибки не выдаём частичный остаток результата
         if result.is_err() {
             self.done = true;
         }
@@ -77,7 +94,7 @@ impl SelectStream {
             Some(predicate) => crate::expr::filter(&block, predicate)?,
             None => block,
         };
-        // LIMIT считает подходящие строки, а не исходные строки или блоки.
+        // LIMIT считает подходящие строки, а не исходные строки или блоки
         if let Some(remaining) = &mut self.remaining {
             let keep = (*remaining).min(block.rows() as u64) as usize;
             if keep < block.rows() {
