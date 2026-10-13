@@ -23,12 +23,23 @@ pub(crate) fn plan(query: SelectQuery, catalog: &dyn Catalog) -> Result<QueryPla
             }
         }
     }
+    let is_aggregate = expressions
+        .iter()
+        .any(|(e, _)| matches!(e, Expr::Function { .. }));
+    let mut aggregates = Vec::new();
     let mut output_names = HashSet::new();
     let mut columns = Vec::new();
     let mut header = Vec::new();
     let mut projection = Vec::new();
     for (expr, output) in expressions {
-        let (expr, data_type) = crate::expr::bind_scalar(expr, schema)?;
+        let (expr, data_type) = if is_aggregate {
+            let spec = crate::aggregate::AggregateSpec::bind(expr.clone(), schema)?;
+            let data_type = spec.data_type;
+            aggregates.push(spec);
+            (expr, data_type)
+        } else {
+            crate::expr::bind_scalar(expr, schema)?
+        };
         if !output_names.insert(output.clone()) {
             return Err(DbError::Unsupported(format!(
                 "повторяющееся имя результата '{output}': укажите разные псевдонимы AS"
@@ -66,5 +77,6 @@ pub(crate) fn plan(query: SelectQuery, catalog: &dyn Catalog) -> Result<QueryPla
         projection,
         header,
         limit: query.limit,
+        aggregates: is_aggregate.then_some(aggregates),
     })
 }

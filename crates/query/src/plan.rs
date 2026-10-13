@@ -8,6 +8,7 @@ pub(crate) struct QueryPlan {
     pub projection: Vec<ProjectionColumn>,
     pub header: Vec<ColumnDef>,
     pub limit: Option<u64>,
+    pub aggregates: Option<Vec<crate::aggregate::AggregateSpec>>,
 }
 
 pub(crate) struct ProjectionColumn {

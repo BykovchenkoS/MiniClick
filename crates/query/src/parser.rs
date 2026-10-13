@@ -21,6 +21,8 @@ pub(crate) fn parse(sql: &str) -> Result<Command> {
         return Err(DbError::Syntax("пустой SQL-запрос".into()));
     }
     let statement = parser.parse_statement().map_err(syntax)?;
+    // В sqlparser 0.53 CREATE не включает SETTINGS: разбираем только этот
+    // хвост токенами библиотеки, не разделяем исходный SQL по строкам/пробелам.
     let settings = if matches!(statement, Statement::CreateTable(_))
         && parser.parse_keyword(Keyword::SETTINGS)
     {
@@ -274,11 +276,12 @@ fn translate(query: Query) -> Result<SelectQuery> {
     })
 }
 
-// Переводим только поддерживаемые выражения, типы проверит планировщик
+// Переводим только поддерживаемые выражения; типы проверит планировщик.
 fn translate_expr(expr: Expr) -> Result<types::Expr> {
     use sqlparser::ast::{BinaryOperator as B, UnaryOperator as U, Value as V};
     use types::{BinaryOp as Op, Expr as E, UnaryOp};
     match expr {
+        Expr::Function(function) => translate_function(function),
         Expr::Identifier(id) => Ok(E::Column(id.value)),
         Expr::Nested(expr) => translate_expr(*expr),
         Expr::Value(V::SingleQuotedString(text)) => Ok(E::Literal(types::Value::String(text))),
@@ -359,6 +362,62 @@ fn translate_limit(expr: Expr) -> Result<u64> {
     Err(DbError::Syntax(
         "LIMIT должен быть неотрицательным целым литералом".into(),
     ))
+}
+
+fn translate_function(function: sqlparser::ast::Function) -> Result<types::Expr> {
+    use sqlparser::ast::{Function, FunctionArg, FunctionArgExpr, FunctionArguments};
+    let Function {
+        name,
+        uses_odbc_syntax,
+        parameters,
+        args,
+        filter,
+        null_treatment,
+        over,
+        within_group,
+    } = function;
+    if name.0.len() != 1
+        || uses_odbc_syntax
+        || !matches!(parameters, FunctionArguments::None)
+        || filter.is_some()
+        || null_treatment.is_some()
+        || over.is_some()
+        || !within_group.is_empty()
+    {
+        return Err(unsupported("модификаторы агрегатной функции"));
+    }
+    let name = name.0[0].value.to_ascii_lowercase();
+    if !matches!(name.as_str(), "count" | "sum" | "min" | "max") {
+        return Err(unsupported("функция"));
+    }
+    let FunctionArguments::List(list) = args else {
+        return Err(unsupported("аргументы функции"));
+    };
+    if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+        return Err(unsupported(
+            "DISTINCT, ALL или дополнительные условия агрегата",
+        ));
+    }
+    let wildcard = list.args.len() == 1
+        && matches!(
+            &list.args[0],
+            FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+        );
+    let args = if name == "count" && wildcard {
+        Vec::new()
+    } else {
+        list.args
+            .into_iter()
+            .map(|a| match a {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => translate_expr(e),
+                _ => Err(unsupported("именованный аргумент или wildcard агрегата")),
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    if (name == "count" && args.len() > 1) || (name != "count" && args.len() != 1) {
+        return Err(unsupported("неверное число аргументов агрегата"));
+    }
+    Ok(types::Expr::Function { name, args })
 }
 
 #[cfg(test)]
@@ -443,7 +502,6 @@ mod tests {
             "SELECT * FROM events ORDER BY id",
             "SELECT DISTINCT id FROM events",
             "SELECT id FROM events GROUP BY id",
-            "SELECT count() FROM events",
             "SELECT 1",
             "SELECT * FROM events, other",
             "SELECT * FROM events JOIN other ON events.id = other.id",
