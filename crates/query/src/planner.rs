@@ -84,6 +84,61 @@ pub(crate) fn plan(query: SelectQuery, catalog: &dyn Catalog) -> Result<QueryPla
             output,
         });
     }
+    let output_width = header.len();
+    let mut order_by = Vec::new();
+    for item in query.order_by {
+        
+        // Имя результата имеет приоритет над одноимённой исходной колонкой
+        let index = if let Some(index) = header[..output_width]
+            .iter()
+            .position(|c| c.name == item.name)
+        {
+            index
+        } else {
+            let column = schema
+                .column(&item.name)
+                .ok_or_else(|| DbError::UnknownColumn(item.name.clone()))?;
+            if grouped {
+                let key = keys
+                    .iter()
+                    .position(|c| c.name == item.name)
+                    .ok_or_else(|| {
+                        DbError::Unsupported(format!(
+                            "ORDER BY: '{}' не входит в GROUP BY",
+                            item.name
+                        ))
+                    })?;
+                group_outputs.push(GroupOutput::Key(key));
+            } else if is_aggregate {
+                return Err(DbError::Unsupported(
+                    "ORDER BY глобального агрегата ожидает имя результата".into(),
+                ));
+            }
+            let index = header.len();
+            let mut hidden = format!("__sort_{index}");
+            while header.iter().any(|c| c.name == hidden) {
+                hidden.push('_');
+            }
+            header.push(ColumnDef {
+                name: hidden.clone(),
+                data_type: column.data_type,
+            });
+            projection.push(ProjectionColumn {
+                expr: Expr::col(&item.name),
+                data_type: column.data_type,
+                output: hidden,
+            });
+            if !columns.contains(&item.name) {
+                columns.push(item.name);
+            }
+            index
+        };
+        order_by.push(crate::plan::SortKey {
+            index,
+            ascending: item.ascending,
+        });
+    }
+    
     for key in &keys {
         if !columns.contains(&key.name) {
             columns.push(key.name.clone());
@@ -101,6 +156,8 @@ pub(crate) fn plan(query: SelectQuery, catalog: &dyn Catalog) -> Result<QueryPla
         }
     }
     Ok(QueryPlan {
+        order_by,
+        output_width,
         table,
         scan: ScanRequest { columns, predicate },
         projection,

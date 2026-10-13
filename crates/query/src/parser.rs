@@ -110,7 +110,6 @@ fn translate(query: Query) -> Result<SelectQuery> {
     } = query;
     for (present, name) in [
         (with.is_some(), "WITH"),
-        (order_by.is_some(), "ORDER BY"),
         (!limit_by.is_empty(), "LIMIT BY"),
         (offset.is_some(), "OFFSET"),
         (fetch.is_some(), "FETCH"),
@@ -274,6 +273,10 @@ fn translate(query: Query) -> Result<SelectQuery> {
     Ok(SelectQuery {
         table,
         group_by,
+        order_by: order_by
+            .map(translate_order)
+            .transpose()?
+            .unwrap_or_default(),
         projection,
         predicate: selection.map(translate_expr).transpose()?,
         limit: limit.map(translate_limit).transpose()?,
@@ -423,6 +426,34 @@ fn translate_function(function: sqlparser::ast::Function) -> Result<types::Expr>
     Ok(types::Expr::Function { name, args })
 }
 
+fn translate_order(order: sqlparser::ast::OrderBy) -> Result<Vec<crate::ast::OrderItem>> {
+    let sqlparser::ast::OrderBy { exprs, interpolate } = order;
+    if interpolate.is_some() || exprs.is_empty() {
+        return Err(unsupported("ORDER BY INTERPOLATE или пустой список"));
+    }
+    exprs
+        .into_iter()
+        .map(|item| {
+            let sqlparser::ast::OrderByExpr {
+                expr,
+                asc,
+                nulls_first,
+                with_fill,
+            } = item;
+            if nulls_first.is_some() || with_fill.is_some() {
+                return Err(unsupported("NULLS FIRST/LAST или WITH FILL"));
+            }
+            let Expr::Identifier(id) = expr else {
+                return Err(unsupported("ORDER BY ожидает имя колонки или алиас SELECT"));
+            };
+            Ok(crate::ast::OrderItem {
+                name: id.value,
+                ascending: asc.unwrap_or(true),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,6 +471,7 @@ mod tests {
             parse("SELECT name AS label, id FROM events;").unwrap(),
             SelectQuery {
                 group_by: vec![],
+                order_by: vec![],
                 table: "events".into(),
                 predicate: None,
                 limit: None,
@@ -463,6 +495,7 @@ mod tests {
             parse("select `User ID` from `Events`;").unwrap(),
             SelectQuery {
                 group_by: vec![],
+                order_by: vec![],
                 table: "Events".into(),
                 predicate: None,
                 limit: None,
@@ -480,6 +513,7 @@ mod tests {
             parse("-- demo\nsElEcT /* comment */ * FrOm events;").unwrap(),
             SelectQuery {
                 group_by: vec![],
+                order_by: vec![],
                 table: "events".into(),
                 predicate: None,
                 limit: None,
@@ -504,7 +538,6 @@ mod tests {
     fn rejects_unsupported_ast_without_ignoring_clauses() {
         for sql in [
             "SELECT * FROM events PREWHERE id = 1",
-            "SELECT * FROM events ORDER BY id",
             "SELECT DISTINCT id FROM events",
             "SELECT 1",
             "SELECT * FROM events, other",

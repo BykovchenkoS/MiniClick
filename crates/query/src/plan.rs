@@ -1,7 +1,10 @@
 use std::sync::Arc;
 use types::{ColumnDef, ScanRequest, Table};
 
+/// Проверенный план. Хэндл удерживает ту таблицу, по схеме которой строился план.
 pub(crate) struct QueryPlan {
+    pub order_by: Vec<SortKey>,
+    pub output_width: usize,
     pub table: Arc<dyn Table>,
     pub scan: ScanRequest,
     pub projection: Vec<ProjectionColumn>,
@@ -24,4 +27,9 @@ pub(crate) struct GroupPlan {
 pub(crate) enum GroupOutput {
     Key(usize),
     Aggregate(usize),
+}
+
+pub(crate) struct SortKey {
+    pub index: usize,
+    pub ascending: bool,
 }

@@ -2,6 +2,7 @@
 #[derive(Debug, PartialEq)]
 pub(crate) struct SelectQuery {
     pub table: String,
+    pub order_by: Vec<OrderItem>,
     pub group_by: Vec<String>,
     pub projection: Vec<SelectItem>,
     pub predicate: Option<types::Expr>,
@@ -36,4 +37,10 @@ pub(crate) enum Command {
     Optimize {
         name: String,
     },
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct OrderItem {
+    pub name: String,
+    pub ascending: bool,
 }

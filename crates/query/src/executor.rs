@@ -2,6 +2,9 @@ use crate::plan::{ProjectionColumn, QueryPlan};
 use types::{Block, BlockStream, Column, Expr, QueryOutput, Result};
 
 pub(crate) fn execute(plan: QueryPlan) -> Result<QueryOutput> {
+    if !plan.order_by.is_empty() {
+        return crate::sort::execute(plan);
+    }
     if plan.limit == Some(0) {
         return Ok(QueryOutput::Rows {
             header: plan.header,

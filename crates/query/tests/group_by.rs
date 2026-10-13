@@ -357,7 +357,6 @@ fn unsupported_grouping_forms_are_rejected() {
         "()",
         "events.event",
         "event HAVING count() > 1",
-        "event ORDER BY event",
     ] {
         assert!(
             e.execute(&format!("SELECT count() FROM events GROUP BY {suffix}"))

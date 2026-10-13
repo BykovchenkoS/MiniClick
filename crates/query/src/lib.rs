@@ -12,5 +12,6 @@ mod expr;
 mod parser;
 mod plan;
 mod planner;
+mod sort;
 
 pub use engine::SqlQueryEngine;
