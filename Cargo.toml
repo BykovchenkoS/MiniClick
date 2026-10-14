@@ -14,3 +14,13 @@ lz4_flex = "0.14"
 zstd = "0.13"
 tempfile = "3"
 tracing = "0.1"
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
+clap = { version = "4", features = ["derive"] }
+csv = "1"
+toml = "0.8"
+uuid = { version = "1", features = ["v4"] }
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }

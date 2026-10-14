@@ -1,0 +1,25 @@
+name: Rust
+on:
+  pull_request:
+  push:
+    branches: [main, feat/storage]
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.90.0'
+          components: rustfmt, clippy
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --locked --workspace
+      - name: Release
+        run: cargo build --locked --release --bin miniclick --example generate_data
+      - name: Demo
+        run: ROWS=120 EXTRA_ROWS=10 bash scripts/demo.sh

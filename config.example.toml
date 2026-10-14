@@ -1,0 +1,7 @@
+# CLI имеет приоритет над TOML. Относительные пути считаются от рабочего каталога.
+listen_addr = "127.0.0.1:8123"
+data_dir = "./data"
+node_id = "node-1"
+role = "Leader"
+max_body_bytes = 268435456
+# Размер гранулы и кодек пока задаются только в CREATE TABLE ... SETTINGS.

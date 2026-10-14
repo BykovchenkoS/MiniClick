@@ -1,0 +1,2 @@
+# Bash-сценарии сохраняют Linux-переводы строк и при checkout в Windows.
+*.sh text eol=lf
