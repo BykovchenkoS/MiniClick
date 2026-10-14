@@ -2,8 +2,6 @@ use crate::{ast::Command, executor, parser, planner};
 use std::sync::Arc;
 use types::{Catalog, QueryEngine, QueryOutput, Result};
 
-/// Фасад Query: SQL → собственное AST → проверенный план → поток блоков.
-/// Catalog передаётся извне; подходит и MemCatalog, и постоянный каталог.
 pub struct SqlQueryEngine {
     catalog: Arc<dyn Catalog>,
 }
@@ -17,6 +15,10 @@ impl SqlQueryEngine {
 impl QueryEngine for SqlQueryEngine {
     fn execute(&self, sql: &str) -> Result<QueryOutput> {
         match parser::parse(sql)? {
+            Command::Explain(query) => {
+                let plan = planner::plan(query, self.catalog.as_ref())?;
+                crate::explain::execute(&plan)
+            }
             Command::Select(query) => {
                 let plan = planner::plan(query, self.catalog.as_ref())?;
                 executor::execute(plan)

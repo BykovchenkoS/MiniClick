@@ -2,6 +2,8 @@
 #[derive(Debug, PartialEq)]
 pub(crate) struct SelectQuery {
     pub table: String,
+    pub order_by: Vec<OrderItem>,
+    pub group_by: Vec<String>,
     pub projection: Vec<SelectItem>,
     pub predicate: Option<types::Expr>,
     pub limit: Option<u64>,
@@ -21,10 +23,10 @@ pub(crate) enum SelectItem {
     },
 }
 
-/// Внутренний результат перевода SQL. Не является общим интерфейсом проекта.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Command {
     Select(SelectQuery),
+    Explain(SelectQuery),
     Create {
         definition: types::TableDefinition,
         if_not_exists: bool,
@@ -36,4 +38,10 @@ pub(crate) enum Command {
     Optimize {
         name: String,
     },
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct OrderItem {
+    pub name: String,
+    pub ascending: bool,
 }

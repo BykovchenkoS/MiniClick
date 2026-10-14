@@ -203,3 +203,43 @@ fn reader_rejects_inconsistent_metadata_marks_index_and_column_frames() {
         Err(DbError::Internal(_))
     ));
 }
+
+#[test]
+fn directory_sync_accepts_existing_directory() {
+    let root = tempfile::tempdir().unwrap();
+    sync_directory(root.path()).unwrap();
+}
+
+#[test]
+fn directory_sync_propagates_missing_path() {
+    let root = tempfile::tempdir().unwrap();
+    let error = sync_directory(&root.path().join("missing")).unwrap_err();
+    assert!(matches!(error, DbError::Io(e) if e.kind() == std::io::ErrorKind::NotFound));
+}
+
+#[cfg(windows)]
+#[test]
+fn directory_sync_rejects_regular_file_on_windows() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("file");
+    fs::write(&path, b"data").unwrap();
+    let error = sync_directory(&path).unwrap_err();
+    assert!(matches!(error, DbError::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput));
+}
+
+#[test]
+fn abandoning_written_granule_removes_temporary_files_and_allows_retry() {
+    let root = tempfile::tempdir().unwrap();
+    let def = definition(Codec::None);
+    let input = block(&[1, 2], &["a", "b"]);
+    {
+        let mut writer = PartWriter::new(root.path(), "all_1_1_0", &def).unwrap();
+        writer.write_granule(&input).unwrap();
+        assert!(root.path().join("tmp_all_1_1_0/id.bin").exists());
+    }
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    let meta = write_part(root.path(), "all_1_1_0", &def, &input).unwrap();
+    assert_eq!(meta.rows, 2);
+    assert!(root.path().join("all_1_1_0/part.json").exists());
+    assert!(!root.path().join("tmp_all_1_1_0").exists());
+}

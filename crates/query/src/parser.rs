@@ -21,6 +21,7 @@ pub(crate) fn parse(sql: &str) -> Result<Command> {
         return Err(DbError::Syntax("пустой SQL-запрос".into()));
     }
     let statement = parser.parse_statement().map_err(syntax)?;
+
     let settings = if matches!(statement, Statement::CreateTable(_))
         && parser.parse_keyword(Keyword::SETTINGS)
     {
@@ -41,6 +42,29 @@ pub(crate) fn parse(sql: &str) -> Result<Command> {
         });
     }
     match statement {
+        Statement::Explain {
+            describe_alias,
+            analyze,
+            verbose,
+            query_plan,
+            statement,
+            format,
+            options,
+        } => {
+            if describe_alias != sqlparser::ast::DescribeAlias::Explain
+                || analyze
+                || verbose
+                || query_plan
+                || format.is_some()
+                || options.is_some()
+            {
+                return Err(unsupported("опции EXPLAIN, ANALYZE или DESCRIBE"));
+            }
+            let Statement::Query(query) = *statement else {
+                return Err(unsupported("EXPLAIN только для SELECT"));
+            };
+            Ok(Command::Explain(translate(*query)?))
+        }
         Statement::Query(query) => Ok(Command::Select(translate(*query)?)),
         Statement::CreateTable(create) => crate::ddl::create(create, settings),
         Statement::Drop {
@@ -94,8 +118,6 @@ pub(crate) fn syntax(error: sqlparser::parser::ParserError) -> DbError {
 }
 
 fn translate(query: Query) -> Result<SelectQuery> {
-    // Перечисляем ВСЕ поля: обновление sqlparser потребует пересмотра адаптера.
-    // Нельзя молча проигнорировать часть запроса и вернуть неверные данные.
     let Query {
         with,
         body,
@@ -111,7 +133,6 @@ fn translate(query: Query) -> Result<SelectQuery> {
     } = query;
     for (present, name) in [
         (with.is_some(), "WITH"),
-        (order_by.is_some(), "ORDER BY"),
         (!limit_by.is_empty(), "LIMIT BY"),
         (offset.is_some(), "OFFSET"),
         (fetch.is_some(), "FETCH"),
@@ -149,16 +170,22 @@ fn translate(query: Query) -> Result<SelectQuery> {
         value_table_mode,
         connect_by,
     } = *select;
-    let has_group_by = !matches!(group_by,
-        GroupByExpr::Expressions(ref exprs, ref modifiers)
-            if exprs.is_empty() && modifiers.is_empty());
+    let group_by = match group_by {
+        GroupByExpr::Expressions(exprs, modifiers) if modifiers.is_empty() => exprs
+            .into_iter()
+            .map(|expr| match expr {
+                Expr::Identifier(id) => Ok(id.value),
+                _ => Err(unsupported("GROUP BY поддерживает только имена колонок")),
+            })
+            .collect::<Result<Vec<_>>>()?,
+        _ => return Err(unsupported("GROUP BY ALL, ROLLUP, CUBE и модификаторы")),
+    };
     for (present, name) in [
         (distinct.is_some(), "DISTINCT"),
         (top.is_some(), "TOP"),
         (into.is_some(), "SELECT INTO"),
         (!lateral_views.is_empty(), "LATERAL VIEW"),
         (prewhere.is_some(), "PREWHERE"),
-        (has_group_by, "GROUP BY"),
         (!cluster_by.is_empty(), "CLUSTER BY"),
         (!distribute_by.is_empty(), "DISTRIBUTE BY"),
         (!sort_by.is_empty(), "SORT BY"),
@@ -268,17 +295,23 @@ fn translate(query: Query) -> Result<SelectQuery> {
     }
     Ok(SelectQuery {
         table,
+        group_by,
+        order_by: order_by
+            .map(translate_order)
+            .transpose()?
+            .unwrap_or_default(),
         projection,
         predicate: selection.map(translate_expr).transpose()?,
         limit: limit.map(translate_limit).transpose()?,
     })
 }
 
-// Переводим только поддерживаемые выражения, типы проверит планировщик
+// Переводим только поддерживаемые выражения, типы проверит планировщик.
 fn translate_expr(expr: Expr) -> Result<types::Expr> {
     use sqlparser::ast::{BinaryOperator as B, UnaryOperator as U, Value as V};
     use types::{BinaryOp as Op, Expr as E, UnaryOp};
     match expr {
+        Expr::Function(function) => translate_function(function),
         Expr::Identifier(id) => Ok(E::Column(id.value)),
         Expr::Nested(expr) => translate_expr(*expr),
         Expr::Value(V::SingleQuotedString(text)) => Ok(E::Literal(types::Value::String(text))),
@@ -287,18 +320,13 @@ fn translate_expr(expr: Expr) -> Result<types::Expr> {
             op: UnaryOp::Not,
             expr: Box::new(translate_expr(*expr)?),
         }),
-        Expr::UnaryOp { op: U::Minus, expr } => {
-            // Сначала разбираем знак, чтобы принять i64::MIN без переполнения.
-            match *expr {
-                Expr::Value(V::Number(text, _)) => {
-                    Ok(E::Literal(parse_number(&format!("-{text}"))?))
-                }
-                expr => Ok(E::Unary {
-                    op: UnaryOp::Neg,
-                    expr: Box::new(translate_expr(expr)?),
-                }),
-            }
-        }
+        Expr::UnaryOp { op: U::Minus, expr } => match *expr {
+            Expr::Value(V::Number(text, _)) => Ok(E::Literal(parse_number(&format!("-{text}"))?)),
+            expr => Ok(E::Unary {
+                op: UnaryOp::Neg,
+                expr: Box::new(translate_expr(expr)?),
+            }),
+        },
         Expr::UnaryOp { op: U::Plus, expr } => match *expr {
             Expr::Value(V::Number(text, _)) => Ok(E::Literal(parse_number(&text)?)),
             _ => Err(unsupported("унарный плюс вне числового литерала")),
@@ -361,11 +389,94 @@ fn translate_limit(expr: Expr) -> Result<u64> {
     ))
 }
 
+fn translate_function(function: sqlparser::ast::Function) -> Result<types::Expr> {
+    use sqlparser::ast::{Function, FunctionArg, FunctionArgExpr, FunctionArguments};
+    let Function {
+        name,
+        uses_odbc_syntax,
+        parameters,
+        args,
+        filter,
+        null_treatment,
+        over,
+        within_group,
+    } = function;
+    if name.0.len() != 1
+        || uses_odbc_syntax
+        || !matches!(parameters, FunctionArguments::None)
+        || filter.is_some()
+        || null_treatment.is_some()
+        || over.is_some()
+        || !within_group.is_empty()
+    {
+        return Err(unsupported("модификаторы агрегатной функции"));
+    }
+    let name = name.0[0].value.to_ascii_lowercase();
+    if !matches!(name.as_str(), "count" | "sum" | "min" | "max") {
+        return Err(unsupported("функция"));
+    }
+    let FunctionArguments::List(list) = args else {
+        return Err(unsupported("аргументы функции"));
+    };
+    if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+        return Err(unsupported(
+            "DISTINCT, ALL или дополнительные условия агрегата",
+        ));
+    }
+    let wildcard = list.args.len() == 1
+        && matches!(
+            &list.args[0],
+            FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+        );
+    let args = if name == "count" && wildcard {
+        Vec::new()
+    } else {
+        list.args
+            .into_iter()
+            .map(|a| match a {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => translate_expr(e),
+                _ => Err(unsupported("именованный аргумент или wildcard агрегата")),
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    if (name == "count" && args.len() > 1) || (name != "count" && args.len() != 1) {
+        return Err(unsupported("неверное число аргументов агрегата"));
+    }
+    Ok(types::Expr::Function { name, args })
+}
+
+fn translate_order(order: sqlparser::ast::OrderBy) -> Result<Vec<crate::ast::OrderItem>> {
+    let sqlparser::ast::OrderBy { exprs, interpolate } = order;
+    if interpolate.is_some() || exprs.is_empty() {
+        return Err(unsupported("ORDER BY INTERPOLATE или пустой список"));
+    }
+    exprs
+        .into_iter()
+        .map(|item| {
+            let sqlparser::ast::OrderByExpr {
+                expr,
+                asc,
+                nulls_first,
+                with_fill,
+            } = item;
+            if nulls_first.is_some() || with_fill.is_some() {
+                return Err(unsupported("NULLS FIRST/LAST или WITH FILL"));
+            }
+            let Expr::Identifier(id) = expr else {
+                return Err(unsupported("ORDER BY ожидает имя колонки или алиас SELECT"));
+            };
+            Ok(crate::ast::OrderItem {
+                name: id.value,
+                ascending: asc.unwrap_or(true),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Существующие тесты SELECT продолжают проверять его собственное AST.
     fn parse(sql: &str) -> Result<SelectQuery> {
         match super::parse(sql)? {
             Command::Select(query) => Ok(query),
@@ -378,6 +489,8 @@ mod tests {
         assert_eq!(
             parse("SELECT name AS label, id FROM events;").unwrap(),
             SelectQuery {
+                group_by: vec![],
+                order_by: vec![],
                 table: "events".into(),
                 predicate: None,
                 limit: None,
@@ -400,6 +513,8 @@ mod tests {
         assert_eq!(
             parse("select `User ID` from `Events`;").unwrap(),
             SelectQuery {
+                group_by: vec![],
+                order_by: vec![],
                 table: "Events".into(),
                 predicate: None,
                 limit: None,
@@ -416,6 +531,8 @@ mod tests {
         assert_eq!(
             parse("-- demo\nsElEcT /* comment */ * FrOm events;").unwrap(),
             SelectQuery {
+                group_by: vec![],
+                order_by: vec![],
                 table: "events".into(),
                 predicate: None,
                 limit: None,
@@ -440,10 +557,7 @@ mod tests {
     fn rejects_unsupported_ast_without_ignoring_clauses() {
         for sql in [
             "SELECT * FROM events PREWHERE id = 1",
-            "SELECT * FROM events ORDER BY id",
             "SELECT DISTINCT id FROM events",
-            "SELECT id FROM events GROUP BY id",
-            "SELECT count() FROM events",
             "SELECT 1",
             "SELECT * FROM events, other",
             "SELECT * FROM events JOIN other ON events.id = other.id",
