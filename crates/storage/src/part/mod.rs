@@ -109,8 +109,19 @@ pub(crate) fn sort_block(block: &Block, definition: &TableDefinition) -> Result<
     Ok(block.take(&indices))
 }
 
+#[cfg(not(windows))]
 pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
+    if !fs::metadata(path)?.is_dir() {
+        return Err(
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "directory expected").into(),
+        );
+    }
     Ok(())
 }
 
@@ -250,8 +261,18 @@ impl PartWriter {
             &format::encode_index(&self.index, granules)?,
         )?;
         write_file(&self.temporary.join("part.json"), &json)?;
+        self.columns.clear();
         sync_directory(&self.temporary)?;
-        fs::rename(&self.temporary, &self.target)?;
+        fs::rename(&self.temporary, &self.target).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "rename part directory {} -> {}: {error}",
+                    self.temporary.display(),
+                    self.target.display(),
+                ),
+            )
+        })?;
         // После публикации каталог принадлежит репозиторию, даже если fsync не удался.
         self.published = true;
         sync_directory(
@@ -266,6 +287,8 @@ impl PartWriter {
 impl Drop for PartWriter {
     fn drop(&mut self) {
         if !self.published {
+            // Освобождаем файловые дескрипторы до удаления незавершённого part
+            self.columns.clear();
             let _ = fs::remove_dir_all(&self.temporary);
         }
     }
