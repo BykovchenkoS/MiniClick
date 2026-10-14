@@ -10,3 +10,7 @@ version = "0.1.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlparser = { version = "=0.53.0", default-features = false, features = ["std"] }
+lz4_flex = "0.14"
+zstd = "0.13"
+tempfile = "3"
+tracing = "0.1"
