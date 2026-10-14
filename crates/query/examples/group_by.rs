@@ -26,7 +26,7 @@ fn main() -> Result<()> {
         },
         false,
     )?;
-    
+
     catalog.get_table("events")?.insert(Block::new(vec![
         Column {
             name: "id".into(),
@@ -42,7 +42,7 @@ fn main() -> Result<()> {
         "SELECT event, count() AS n, sum(id) AS total_id FROM events GROUP BY event".into()
     });
     println!("SQL: {sql}");
-    
+
     if let QueryOutput::Rows { header, stream } = engine.execute(&sql)? {
         println!(
             "{}",

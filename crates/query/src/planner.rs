@@ -87,7 +87,6 @@ pub(crate) fn plan(query: SelectQuery, catalog: &dyn Catalog) -> Result<QueryPla
     let output_width = header.len();
     let mut order_by = Vec::new();
     for item in query.order_by {
-        
         // Имя результата имеет приоритет над одноимённой исходной колонкой
         let index = if let Some(index) = header[..output_width]
             .iter()
@@ -138,7 +137,7 @@ pub(crate) fn plan(query: SelectQuery, catalog: &dyn Catalog) -> Result<QueryPla
             ascending: item.ascending,
         });
     }
-    
+
     for key in &keys {
         if !columns.contains(&key.name) {
             columns.push(key.name.clone());

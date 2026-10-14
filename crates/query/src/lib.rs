@@ -8,6 +8,7 @@ mod ast;
 mod ddl;
 mod engine;
 mod executor;
+mod explain;
 mod expr;
 mod parser;
 mod plan;

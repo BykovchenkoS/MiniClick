@@ -80,7 +80,7 @@ impl Iterator for SelectStream {
             }
         };
         let result = item.and_then(|block| self.process(block));
-        
+
         // После ошибки не выдаём частичный остаток результата
         if result.is_err() {
             self.done = true;

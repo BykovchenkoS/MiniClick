@@ -17,6 +17,10 @@ impl SqlQueryEngine {
 impl QueryEngine for SqlQueryEngine {
     fn execute(&self, sql: &str) -> Result<QueryOutput> {
         match parser::parse(sql)? {
+            Command::Explain(query) => {
+                let plan = planner::plan(query, self.catalog.as_ref())?;
+                crate::explain::execute(&plan)
+            }
             Command::Select(query) => {
                 let plan = planner::plan(query, self.catalog.as_ref())?;
                 executor::execute(plan)
