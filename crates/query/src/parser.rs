@@ -320,17 +320,13 @@ fn translate_expr(expr: Expr) -> Result<types::Expr> {
             op: UnaryOp::Not,
             expr: Box::new(translate_expr(*expr)?),
         }),
-        Expr::UnaryOp { op: U::Minus, expr } => {
-            match *expr {
-                Expr::Value(V::Number(text, _)) => {
-                    Ok(E::Literal(parse_number(&format!("-{text}"))?))
-                }
-                expr => Ok(E::Unary {
-                    op: UnaryOp::Neg,
-                    expr: Box::new(translate_expr(expr)?),
-                }),
-            }
-        }
+        Expr::UnaryOp { op: U::Minus, expr } => match *expr {
+            Expr::Value(V::Number(text, _)) => Ok(E::Literal(parse_number(&format!("-{text}"))?)),
+            expr => Ok(E::Unary {
+                op: UnaryOp::Neg,
+                expr: Box::new(translate_expr(expr)?),
+            }),
+        },
         Expr::UnaryOp { op: U::Plus, expr } => match *expr {
             Expr::Value(V::Number(text, _)) => Ok(E::Literal(parse_number(&text)?)),
             _ => Err(unsupported("унарный плюс вне числового литерала")),
