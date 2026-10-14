@@ -1,4 +1,3 @@
-//! EXPLAIN использует тот же проверенный план, что и SELECT.
 use crate::plan::QueryPlan;
 use types::*;
 

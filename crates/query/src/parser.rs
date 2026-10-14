@@ -21,8 +21,7 @@ pub(crate) fn parse(sql: &str) -> Result<Command> {
         return Err(DbError::Syntax("пустой SQL-запрос".into()));
     }
     let statement = parser.parse_statement().map_err(syntax)?;
-    // В sqlparser 0.53 CREATE не включает SETTINGS: разбираем только этот
-    // хвост токенами библиотеки, не разделяем исходный SQL по строкам/пробелам.
+
     let settings = if matches!(statement, Statement::CreateTable(_))
         && parser.parse_keyword(Keyword::SETTINGS)
     {
@@ -119,8 +118,6 @@ pub(crate) fn syntax(error: sqlparser::parser::ParserError) -> DbError {
 }
 
 fn translate(query: Query) -> Result<SelectQuery> {
-    // Перечисляем ВСЕ поля: обновление sqlparser потребует пересмотра адаптера.
-    // Нельзя молча проигнорировать часть запроса и вернуть неверные данные.
     let Query {
         with,
         body,
@@ -309,7 +306,7 @@ fn translate(query: Query) -> Result<SelectQuery> {
     })
 }
 
-// Переводим только поддерживаемые выражения; типы проверит планировщик.
+// Переводим только поддерживаемые выражения, типы проверит планировщик.
 fn translate_expr(expr: Expr) -> Result<types::Expr> {
     use sqlparser::ast::{BinaryOperator as B, UnaryOperator as U, Value as V};
     use types::{BinaryOp as Op, Expr as E, UnaryOp};
@@ -324,7 +321,6 @@ fn translate_expr(expr: Expr) -> Result<types::Expr> {
             expr: Box::new(translate_expr(*expr)?),
         }),
         Expr::UnaryOp { op: U::Minus, expr } => {
-            // Сначала разбираем знак, чтобы принять i64::MIN без переполнения.
             match *expr {
                 Expr::Value(V::Number(text, _)) => {
                     Ok(E::Literal(parse_number(&format!("-{text}"))?))
@@ -485,7 +481,6 @@ fn translate_order(order: sqlparser::ast::OrderBy) -> Result<Vec<crate::ast::Ord
 mod tests {
     use super::*;
 
-    // Существующие тесты SELECT продолжают проверять его собственное AST.
     fn parse(sql: &str) -> Result<SelectQuery> {
         match super::parse(sql)? {
             Command::Select(query) => Ok(query),

@@ -2,8 +2,6 @@ use crate::{ast::Command, executor, parser, planner};
 use std::sync::Arc;
 use types::{Catalog, QueryEngine, QueryOutput, Result};
 
-/// Фасад Query: SQL → собственное AST → проверенный план → поток блоков.
-/// Catalog передаётся извне; подходит и MemCatalog, и постоянный каталог.
 pub struct SqlQueryEngine {
     catalog: Arc<dyn Catalog>,
 }

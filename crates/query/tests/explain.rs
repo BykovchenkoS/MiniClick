@@ -89,7 +89,6 @@ fn engine(blocks: Vec<Block>) -> SqlQueryEngine {
     SqlQueryEngine::new(catalog)
 }
 
-// Таблица намеренно игнорирует predicate: проверяем точную фильтрацию в Query.
 struct SpyTable {
     definition: TableDefinition,
     request: Mutex<Option<ScanRequest>>,
@@ -117,7 +116,6 @@ impl Table for SpyTable {
         input.push(Err(DbError::Io(std::io::Error::other(
             "ошибка следующего блока",
         ))));
-        // После ошибки есть ещё данные: исполнитель должен остановиться на ошибке.
         input.push(Ok(fixture().select(&req.columns)?));
         let reads = self.reads.clone();
         Ok(Box::new(input.into_iter().inspect(move |_| {

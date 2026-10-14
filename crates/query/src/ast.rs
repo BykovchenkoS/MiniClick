@@ -23,7 +23,6 @@ pub(crate) enum SelectItem {
     },
 }
 
-/// Внутренний результат перевода SQL. Не является общим интерфейсом проекта.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Command {
     Select(SelectQuery),
