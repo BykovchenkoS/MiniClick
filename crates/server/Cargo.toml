@@ -9,3 +9,6 @@ storage = { path = "../storage" }
 query = { path = "../query" }
 catalog = { path = "../catalog" }
 replication = { path = "../replication" }
+
+[dev-dependencies]
+tempfile.workspace = true
