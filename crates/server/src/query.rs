@@ -26,7 +26,13 @@ pub struct QueryParams {
 }
 
 #[utoipa::path(post, path = "/query", tag = "query", params(QueryParams),
-    request_body(content = String, content_type = "text/plain", example = "SELECT * FROM hits WHERE user_id = 42 LIMIT 10"),
+    request_body(content = String, content_type = "text/plain", examples(
+        ("create" = (summary = "Создание демонстрационной таблицы", value = json!(crate::generator::CREATE_SQL))),
+        ("select" = (summary = "Выборка по ключу", value = json!("SELECT user_id, url FROM hits WHERE event_date = '2026-10-01' LIMIT 10"))),
+        ("aggregates" = (summary = "Глобальные агрегаты", value = json!("SELECT count() AS n, sum(delta) AS total, min(event_date) AS first_day, max(event_date) AS last_day FROM hits"))),
+        ("group_by" = (summary = "Группировка и сортировка результата", value = json!("SELECT event_date, count() AS n, sum(delta) AS total FROM hits GROUP BY event_date ORDER BY n DESC, event_date ASC LIMIT 10"))),
+        ("explain" = (summary = "План и отсечение гранул", value = json!("EXPLAIN SELECT user_id FROM hits WHERE event_date = '2026-10-01' LIMIT 10")))
+    )),
     responses(
         (status = 200, description = "Результат запроса или Ok.", content(
             (String = "text/tab-separated-values"), (String = "text/csv"),

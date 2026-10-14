@@ -196,7 +196,7 @@ async fn input_formats_errors_and_unknown_format_have_no_side_effects() {
         ("/query", "SELECT absent FROM hits", StatusCode::BAD_REQUEST),
         (
             "/query",
-            "SELECT * FROM hits ORDER BY id",
+            "SELECT * FROM hits ORDER BY id + 1",
             StatusCode::BAD_REQUEST,
         ),
         (
@@ -387,6 +387,16 @@ async fn openapi_matches_routes_formats_binary_upload_and_vendored_assets() {
         serde_json::json!(["CSV", "TSV", "JSONEachRow"])
     );
     assert!(doc["paths"]["/query"]["post"]["requestBody"]["content"]["text/plain"].is_object());
+    let examples =
+        &doc["paths"]["/query"]["post"]["requestBody"]["content"]["text/plain"]["examples"];
+    assert!(examples["group_by"]["value"]
+        .as_str()
+        .unwrap()
+        .contains("GROUP BY"));
+    assert!(examples["explain"]["value"]
+        .as_str()
+        .unwrap()
+        .starts_with("EXPLAIN SELECT"));
     let html = client
         .get(format!("{}/swagger-ui", server.url))
         .send()
@@ -403,5 +413,220 @@ async fn openapi_matches_routes_formats_binary_upload_and_vendored_assets() {
         .unwrap();
     assert_eq!(javascript.status(), StatusCode::OK);
     assert!(javascript.bytes().await.unwrap().len() > 100_000);
+    server.close().await;
+}
+
+async fn json_rows(client: &Client, server: &TestServer, query: &str) -> Vec<serde_json::Value> {
+    let response = client
+        .post(format!("{}/query?format=JSONEachRow", server.url))
+        .body(query.to_owned())
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let text = response.text().await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{text}");
+    text.lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+async fn seed_queries(client: &Client, server: &TestServer, engine: &str) {
+    sql(client, server, &format!("CREATE TABLE events (id UInt64, label String, amount Int64, ratio Float64) ENGINE = {engine} ORDER BY id SETTINGS index_granularity = 2")).await;
+    for body in [
+        "4,b,40,0.1\n1,a,10,0.2\n3,b,30,0.3\n",
+        "2,a,20,0.4\n2,a,5,0.5\n",
+    ] {
+        let response = client
+            .post(format!("{}/insert/events", server.url))
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+async fn aggregates_grouping_and_hidden_sort_keys_work_over_http_for_both_engines() {
+    for engine in ["Memory", "MergeTree"] {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::start(state(root.path())).await;
+        let client = client();
+        seed_queries(&client, &server, engine).await;
+        assert_eq!(json_rows(&client, &server, "SELECT count() AS n, sum(amount) AS total, min(amount) AS lo, max(amount) AS hi FROM events").await,
+            [serde_json::json!({"n":5,"total":105,"lo":5,"hi":40})]);
+        let floats = json_rows(&client, &server, "SELECT sum(ratio) AS total FROM events").await;
+        assert!((floats[0]["total"].as_f64().unwrap() - 1.5).abs() < 1e-12);
+        assert_eq!(json_rows(&client, &server, "SELECT label, count() AS n, sum(amount) AS total FROM events WHERE id >= 2 GROUP BY label ORDER BY total DESC, label ASC LIMIT 2").await,
+            [serde_json::json!({"label":"b","n":2,"total":70}), serde_json::json!({"label":"a","n":2,"total":25})]);
+        assert_eq!(
+            json_rows(
+                &client,
+                &server,
+                "SELECT amount FROM events ORDER BY id DESC, amount ASC"
+            )
+            .await,
+            [40, 30, 5, 20, 10].map(|amount| serde_json::json!({"amount":amount}))
+        );
+        let csv = client.post(format!("{}/query?format=CSV", server.url))
+            .body("SELECT label, count() AS n FROM events GROUP BY label ORDER BY n DESC, label LIMIT 1")
+            .send().await.unwrap();
+        assert_eq!(csv.status(), StatusCode::OK);
+        assert_eq!(csv.text().await.unwrap(), "a,3\n");
+        let pretty = client
+            .post(format!("{}/query?format=Pretty", server.url))
+            .body("SELECT sum(amount) AS total FROM events")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(pretty.status(), StatusCode::OK);
+        assert_eq!(
+            pretty.text().await.unwrap(),
+            "+-------+\n| total |\n+-------+\n| 105   |\n+-------+\n"
+        );
+        sql(&client, &server, "DROP TABLE events").await;
+        sql(
+            &client,
+            &server,
+            &format!("CREATE TABLE events (id UInt64, amount Int64) ENGINE = {engine} ORDER BY id"),
+        )
+        .await;
+        assert_eq!(json_rows(&client, &server, "SELECT count() AS n, sum(amount) AS total, min(amount) AS lo, max(amount) AS hi FROM events").await,
+            [serde_json::json!({"n":0,"total":0,"lo":0,"hi":0})]);
+        assert!(json_rows(
+            &client,
+            &server,
+            "SELECT id, count() AS n FROM events GROUP BY id ORDER BY id"
+        )
+        .await
+        .is_empty());
+        assert_eq!(
+            sql(&client, &server, "SELECT count() FROM events LIMIT 0").await,
+            ""
+        );
+        server.close().await;
+    }
+}
+
+#[tokio::test]
+async fn explain_uses_the_normal_query_formats_and_counts_pruned_granules() {
+    let root = tempfile::tempdir().unwrap();
+    let server = TestServer::start(state(root.path())).await;
+    let client = client();
+    seed_queries(&client, &server, "MergeTree").await;
+    let query = "EXPLAIN SELECT label FROM events WHERE id > 3 ORDER BY id DESC LIMIT 1";
+    let tsv = sql(&client, &server, query).await;
+    assert!(tsv.contains("Sort [`id` DESC]"));
+    assert!(tsv.contains("parts: 1 / 2, granules: 2 / 3, rows: 3 / 5"));
+    assert_eq!(
+        sql(
+            &client,
+            &server,
+            "SELECT label FROM events WHERE id > 3 ORDER BY id DESC LIMIT 1"
+        )
+        .await,
+        "b\n"
+    );
+    assert_eq!(
+        sql(&client, &server, "SELECT count() FROM events WHERE id > 3").await,
+        "1\n"
+    );
+    let json = json_rows(&client, &server, query).await;
+    let lines: Vec<_> = json
+        .iter()
+        .map(|row| {
+            assert_eq!(row.as_object().unwrap().len(), 1);
+            row["explain"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(lines, tsv.lines().collect::<Vec<_>>());
+    let csv = client
+        .post(format!("{}/query?format=CSV", server.url))
+        .body(query)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(csv.status(), StatusCode::OK);
+    let body = csv.bytes().await.unwrap();
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .from_reader(body.as_ref());
+    let records: Vec<_> = reader
+        .records()
+        .map(|record| record.unwrap().get(0).unwrap().to_owned())
+        .collect();
+    assert_eq!(records, lines);
+    let pretty = client
+        .post(format!("{}/query?format=Pretty", server.url))
+        .body(query)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pretty.status(), StatusCode::OK);
+    let pretty = pretty.text().await.unwrap();
+    assert!(pretty.contains("| explain"));
+    assert!(pretty.contains("parts: 1 / 2, granules: 2 / 3, rows: 3 / 5"));
+    server.close().await;
+}
+
+#[tokio::test]
+async fn actual_late_storage_errors_do_not_leak_sorted_or_aggregated_results() {
+    let root = tempfile::tempdir().unwrap();
+    let app = state(root.path());
+    let server = TestServer::start(app.clone()).await;
+    let client = client();
+    seed_queries(&client, &server, "MergeTree").await;
+    let table = app.catalog.get_table("events").unwrap();
+    let part = table.parts().unwrap().remove(1);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("catalog.json")).unwrap()).unwrap();
+    let path = root
+        .path()
+        .join("tables")
+        .join(manifest["tables"][0]["id"].as_str().unwrap())
+        .join(part)
+        .join("amount.bin");
+    std::fs::write(path, b"broken second part").unwrap();
+    let explain = sql(
+        &client,
+        &server,
+        "EXPLAIN SELECT sum(amount) AS total FROM events",
+    )
+    .await;
+    assert!(explain.contains("parts: 2 / 2, granules: 3 / 3, rows: 5 / 5"));
+    for query in [
+        "SELECT sum(amount) AS total FROM events",
+        "SELECT label, sum(amount) AS total FROM events GROUP BY label LIMIT 1",
+        "SELECT amount FROM events ORDER BY id DESC LIMIT 1",
+    ] {
+        let response = client
+            .post(format!("{}/query", server.url))
+            .body(query)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{query}"
+        );
+        let error: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(error.as_object().unwrap().len(), 1);
+        assert!(error["error"].is_string());
+    }
+    assert_eq!(
+        sql(&client, &server, "SELECT count() FROM events").await,
+        "5\n"
+    );
+    assert_eq!(
+        sql(
+            &client,
+            &server,
+            "SELECT sum(amount) FROM events WHERE id > 3"
+        )
+        .await,
+        "40\n"
+    );
     server.close().await;
 }

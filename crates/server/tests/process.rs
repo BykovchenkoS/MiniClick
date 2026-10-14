@@ -101,6 +101,39 @@ async fn stats(client: &Client, process: &Process) -> serde_json::Value {
         .clone()
 }
 
+async fn assert_query_results(client: &Client, process: &Process, parts: usize, granules: usize) {
+    assert_eq!(
+        sql(
+            client,
+            process,
+            "SELECT count() AS n, sum(id) AS total, min(id) AS lo, max(id) AS hi FROM hits"
+        )
+        .await,
+        "4\t7\t1\t3\n"
+    );
+    assert_eq!(sql(client, process, "SELECT text, count() AS n, sum(id) AS total FROM hits GROUP BY text ORDER BY n DESC, text ASC").await,
+        "a\t2\t2\nb\t1\t2\nc\t1\t3\n");
+    assert_eq!(
+        sql(
+            client,
+            process,
+            "SELECT text FROM hits WHERE id >= 2 ORDER BY id DESC LIMIT 1"
+        )
+        .await,
+        "c\n"
+    );
+    let explain = sql(client, process, "EXPLAIN SELECT text, count() AS n FROM hits WHERE id >= 1 GROUP BY text ORDER BY n DESC, text ASC LIMIT 2").await;
+    assert!(explain.contains("Limit 2"));
+    assert!(explain.contains("Sort [count() DESC"));
+    assert!(explain.contains("Aggregate by [`text`]"));
+    assert!(
+        explain.contains(&format!(
+            "parts: {parts} / {parts}, granules: {granules} / {granules}, rows: 4 / 4"
+        )),
+        "{explain}"
+    );
+}
+
 #[tokio::test]
 async fn separate_process_restarts_preserve_rows_and_optimize_without_duplicates() {
     let root = tempfile::tempdir().unwrap();
@@ -127,9 +160,29 @@ async fn separate_process_restarts_preserve_rows_and_optimize_without_duplicates
         assert_eq!(response.status(), StatusCode::OK);
     }
     assert_eq!(stats(&client, &process).await["parts_total"], 2);
+    assert_query_results(&client, &process, 2, 3).await;
     process.stop().await;
     let process = Process::start(root.path()).await;
     assert_eq!(sql(&client, &process, "SELECT * FROM ephemeral").await, "");
+    assert_eq!(
+        sql(
+            &client,
+            &process,
+            "SELECT count(), sum(id), min(id), max(id) FROM ephemeral"
+        )
+        .await,
+        "0\t0\t0\t0\n"
+    );
+    assert_eq!(
+        sql(
+            &client,
+            &process,
+            "SELECT id, count() AS n FROM ephemeral GROUP BY id ORDER BY id"
+        )
+        .await,
+        ""
+    );
+    assert_query_results(&client, &process, 2, 3).await;
     let before = sql(&client, &process, "SELECT * FROM hits").await;
     let mut rows: Vec<_> = before.lines().collect();
     rows.sort();
@@ -137,6 +190,7 @@ async fn separate_process_restarts_preserve_rows_and_optimize_without_duplicates
     assert_eq!(stats(&client, &process).await["parts_total"], 2);
     sql(&client, &process, "OPTIMIZE TABLE hits").await;
     assert_eq!(stats(&client, &process).await["parts_total"], 1);
+    assert_query_results(&client, &process, 1, 2).await;
     process.stop().await;
     let process = Process::start(root.path()).await;
     assert_eq!(
@@ -144,6 +198,7 @@ async fn separate_process_restarts_preserve_rows_and_optimize_without_duplicates
         "1\ta\n1\ta\n2\tb\n3\tc\n"
     );
     assert_eq!(stats(&client, &process).await["rows_total"], 4);
+    assert_query_results(&client, &process, 1, 2).await;
     sql(&client, &process, "DROP TABLE hits").await;
     sql(
         &client,
@@ -192,6 +247,16 @@ async fn million_rows_over_http_survive_optimize_and_restart() {
     .await;
     assert_eq!(indexed, full);
     assert_eq!(indexed.lines().count(), 33367);
+    let explain = sql(
+        &client,
+        &process,
+        "EXPLAIN SELECT user_id, delta FROM hits WHERE event_date = '2026-10-01'",
+    )
+    .await;
+    assert!(
+        explain.contains("parts: 2 / 2, granules: 6 / 124, rows: 41960 / 1001000"),
+        "{explain}"
+    );
     let log = std::fs::read_to_string(root.path().join("server.log")).unwrap();
     let scans: Vec<_> = log
         .lines()
@@ -215,11 +280,21 @@ async fn million_rows_over_http_survive_optimize_and_restart() {
     );
     assert_eq!(stats(&client, &process).await["rows_total"], 1_001_000);
     assert_eq!(stats(&client, &process).await["parts_total"], 2);
+    let global_query = "SELECT count() AS n, sum(delta) AS total, min(event_date) AS first_day, max(event_date) AS last_day FROM hits";
+    let global = sql(&client, &process, global_query).await;
+    assert_eq!(global, "1001000\t-1810\t2026-10-01\t2026-10-30\n");
+    let grouped_query = "SELECT event_date, count() AS n, sum(delta) AS total FROM hits GROUP BY event_date ORDER BY event_date";
+    let grouped = sql(&client, &process, grouped_query).await;
+    assert_eq!(grouped.lines().count(), 30);
     sql(&client, &process, "OPTIMIZE TABLE hits").await;
     assert_eq!(stats(&client, &process).await["parts_total"], 1);
+    assert_eq!(sql(&client, &process, global_query).await, global);
+    assert_eq!(sql(&client, &process, grouped_query).await, grouped);
     process.stop().await;
     let process = Process::start(root.path()).await;
     assert_eq!(stats(&client, &process).await["rows_total"], 1_001_000);
+    assert_eq!(sql(&client, &process, global_query).await, global);
+    assert_eq!(sql(&client, &process, grouped_query).await, grouped);
     let after = sql(
         &client,
         &process,

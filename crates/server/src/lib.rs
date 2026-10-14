@@ -62,7 +62,7 @@ impl AppState {
     components(schemas(formats::InputFormat, formats::OutputFormat)),
     info(
         title = "MiniClick",
-        description = "CSV/TSV без заголовка. Текущая ветка: SELECT/WHERE/LIMIT, CREATE/DROP/OPTIMIZE; агрегаты и EXPLAIN ожидают блок B."
+        description = "CSV/TSV без заголовка. SQL: CREATE/DROP/OPTIMIZE, SELECT с WHERE, GROUP BY, ORDER BY, LIMIT, агрегатами count/sum/min/max и EXPLAIN SELECT."
     )
 )]
 struct ApiDoc;
