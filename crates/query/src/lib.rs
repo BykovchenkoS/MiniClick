@@ -17,3 +17,13 @@ mod planner;
 mod sort;
 
 pub use engine::SqlQueryEngine;
+
+/// Классифицирует поддерживаемый SQL как запись или чтение.
+/// Нужна серверу, чтобы отклонять запись на реплике до выполнения.
+pub fn is_write(sql: &str) -> types::Result<bool> {
+    use crate::ast::Command;
+    Ok(match parser::parse(sql)? {
+        Command::Select(_) | Command::Explain(_) => false,
+        Command::Create { .. } | Command::Drop { .. } | Command::Optimize { .. } => true,
+    })
+}

@@ -1,14 +1,15 @@
 //! Реализация MergeTree через общий контракт Table.
 
 use crate::merge;
-use crate::part::{internal, sync_directory, validate_block, write_part};
-use crate::repository::PartRepository;
+use crate::part::{internal, part_checksum, sync_directory, validate_block, write_part};
+use crate::repository::{PartId, PartRepository};
 use crate::scan::{self, ScanStream};
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use types::{
-    Block, BlockStream, Result, ScanRequest, ScanStats, Table, TableDefinition, TableFactory,
+    Block, BlockStream, PartData, Result, ScanRequest, ScanStats, Table, TableDefinition,
+    TableFactory,
 };
 
 /// Постоянная таблица; изменения сериализуются, читатели держат снимки parts.
@@ -151,6 +152,47 @@ impl Table for MergeTreeTable {
             .collect::<Result<_>>()?;
         names.sort();
         Ok(names)
+    }
+
+    fn export_part(&self, name: &str) -> Result<PartData> {
+        PartId::parse(name)?;
+        // Снимок удерживает Arc<DataPart>: параллельный OPTIMIZE не удалит файлы,
+        // пока они читаются.
+        let part = self
+            .repository
+            .snapshot()?
+            .into_iter()
+            .find(|part| part.path == self.repository.root.join(name))
+            .ok_or_else(|| internal("part is not active"))?;
+        let mut files = Vec::with_capacity(2 + self.definition.schema.columns.len() * 2);
+        files.push((
+            "part.json".to_owned(),
+            fs::read(part.path.join("part.json"))?,
+        ));
+        files.push((
+            "primary.idx".to_owned(),
+            fs::read(part.path.join("primary.idx"))?,
+        ));
+        for column in &self.definition.schema.columns {
+            let marks = format!("{}.mrk", column.name);
+            let data = format!("{}.bin", column.name);
+            files.push((marks.clone(), fs::read(part.path.join(marks))?));
+            files.push((data.clone(), fs::read(part.path.join(data))?));
+        }
+        let checksum = part_checksum(&files);
+        Ok(PartData {
+            name: name.to_owned(),
+            files,
+            checksum,
+        })
+    }
+
+    fn sync_parts(&self, add: Vec<PartData>, remove: &[String]) -> Result<()> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| internal("table write lock poisoned"))?;
+        self.repository.import(add, remove)
     }
 }
 

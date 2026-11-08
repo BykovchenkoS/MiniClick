@@ -55,6 +55,9 @@ pub async fn query(
     let (content_type, output) = blocking(move || {
         let sql = std::str::from_utf8(&body)
             .map_err(|_| DbError::Syntax("SQL body must be UTF-8".into()))?;
+        if app.is_replica() && ::query::is_write(sql)? {
+            app.check_writable()?;
+        }
         match app.query.execute(sql)? {
             QueryOutput::Ok => Ok(("text/plain; charset=utf-8", b"Ok.\n".to_vec())),
             QueryOutput::Rows { header, stream } => Ok((

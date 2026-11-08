@@ -53,6 +53,7 @@ pub async fn insert(
 ) -> Result<&'static str, ApiError> {
     let Path(name) = path?;
     let Query(params) = params?;
+    app.check_writable()?;
     let body = body?;
     blocking(move || {
         let table = app.catalog.get_table(&name)?;

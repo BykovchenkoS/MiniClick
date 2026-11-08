@@ -8,6 +8,7 @@ pub mod generator;
 mod insert;
 mod meta;
 mod query;
+pub mod replica;
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -17,8 +18,9 @@ use axum::{
 };
 use catalog::DiskCatalog;
 use config::Config;
+use replication::Role;
 use std::sync::Arc;
-use types::{Catalog, Engine, QueryEngine, Result};
+use types::{Catalog, DbError, Engine, QueryEngine, Result};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -47,6 +49,20 @@ impl AppState {
             config,
         })
     }
+
+    pub fn is_replica(&self) -> bool {
+        matches!(self.config.node.role, Role::Replica { .. })
+    }
+
+    /// Реплика не принимает запись: клиента отправляем к лидеру.
+    pub fn check_writable(&self) -> Result<()> {
+        match &self.config.node.role {
+            Role::Leader => Ok(()),
+            Role::Replica { leader_addr, .. } => Err(DbError::NotLeader {
+                leader: leader_addr.clone(),
+            }),
+        }
+    }
 }
 
 #[derive(OpenApi)]
@@ -57,7 +73,11 @@ impl AppState {
         meta::tables,
         meta::describe,
         insert::insert,
-        query::query
+        query::query,
+        replica::ping,
+        replica::tables,
+        replica::parts,
+        replica::part
     ),
     components(schemas(formats::InputFormat, formats::OutputFormat)),
     info(
@@ -70,13 +90,22 @@ struct ApiDoc;
 /// Не выполняет I/O: состояние можно подменить MemCatalog или тестовым QueryEngine.
 pub fn router(state: AppState) -> Router {
     let limit = state.config.max_body_bytes;
-    Router::new()
+    let mut router = Router::new()
         .route("/ping", get(admin::ping))
         .route("/help", get(admin::help))
         .route("/tables", get(meta::tables))
         .route("/tables/{name}", get(meta::describe))
         .route("/insert/{table}", post(insert::insert))
-        .route("/query", post(query::query))
+        .route("/query", post(query::query));
+    // Источником для других реплик служит только лидер.
+    if !state.is_replica() {
+        router = router
+            .route("/replica/ping", get(replica::ping))
+            .route("/replica/tables", get(replica::tables))
+            .route("/replica/tables/{id}/parts", get(replica::parts))
+            .route("/replica/tables/{id}/parts/{part}", get(replica::part));
+    }
+    router
         .fallback(|| async { error::ApiError::new(StatusCode::NOT_FOUND, "unknown endpoint") })
         .method_not_allowed_fallback(|| async {
             error::ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")

@@ -1,8 +1,11 @@
 //! Интерфейсы на границах между треками. Только они общие
 //! внутренние интерфейсы каждой подсистемы живут в её крейте
 
+use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
 
 use crate::block::Block;
 use crate::error::{DbError, Result};
@@ -82,19 +85,58 @@ pub trait Table: Send + Sync {
 
 /// Part целиком: имя и файлы из его каталога (part.json, *.bin, *.mrk, primary.idx).
 /// Parts неизменяемы, поэтому имя однозначно определяет содержимое.
+/// `checksum` — SHA-256 файлов в порядке `files`; защищает передачу от порчи.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartData {
     pub name: String,
     pub files: Vec<(String, Vec<u8>)>,
+    pub checksum: String,
+}
+
+/// Идентификатор таблицы, выданный каталогом при CREATE.
+/// Для остальных подсистем непрозрачен; формат проверяет каталог.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TableId(String);
+
+impl TableId {
+    pub fn new(value: impl Into<String>) -> TableId {
+        TableId(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for TableId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Таблица с идентичностью: используется каталогом и репликацией.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableEntry {
+    pub id: TableId,
+    pub definition: TableDefinition,
+}
+
+/// Идентичность узла: реплика сверяет её, прежде чем менять локальные данные.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeIdentity {
+    pub cluster_id: String,
+    pub node_id: String,
 }
 
 /// Другая нода, к которой реплика ходит за состоянием лидера.
 /// Реализация по сети — трек C; в памяти — types::testing::LocalPeer
 pub trait Peer: Send + Sync {
-    fn ping(&self) -> Result<()>;
-    fn list_tables(&self) -> Result<Vec<TableDefinition>>;
-    fn list_parts(&self, table: &str) -> Result<Vec<String>>;
-    fn fetch_part(&self, table: &str, part: &str) -> Result<PartData>;
+    /// Проверить доступность и вернуть идентичность узла.
+    fn ping(&self) -> Result<NodeIdentity>;
+    fn list_tables(&self) -> Result<Vec<TableEntry>>;
+    fn list_parts(&self, table: &TableId) -> Result<Vec<String>>;
+    fn fetch_part(&self, table: &TableId, part: &str) -> Result<PartData>;
 }
 
 /// Создаёт объект таблицы по описанию. Catalog держит по фабрике на каждый Engine.
@@ -111,6 +153,31 @@ pub trait Catalog: Send + Sync {
     fn get_table(&self, name: &str) -> Result<Arc<dyn Table>>;
     /// Отсортировано по имени.
     fn list_tables(&self) -> Vec<TableDefinition>;
+
+    // --- Идентичность для репликации ---
+
+    /// Все таблицы с идентичностями, отсортированы по имени.
+    /// Каталог без идентичности возвращает пустой список.
+    fn table_entries(&self) -> Vec<TableEntry> {
+        Vec::new()
+    }
+
+    /// Таблица по идентичности. Каталог без идентичности не поддерживает вызов.
+    fn get_table_by_id(&self, _id: &TableId) -> Result<Arc<dyn Table>> {
+        Err(DbError::Unsupported("catalog has no table identity".into()))
+    }
+
+    /// Создать таблицу с заданной идентичностью; нужно только репликации.
+    fn create_table_with_id(
+        &self,
+        _definition: TableDefinition,
+        _id: TableId,
+        _if_not_exists: bool,
+    ) -> Result<()> {
+        Err(DbError::Unsupported(
+            "catalog does not support explicit table identity".into(),
+        ))
+    }
 }
 
 /// Результат SQL-запроса.

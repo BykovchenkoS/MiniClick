@@ -6,7 +6,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use types::{Catalog, DbError, Engine, Result, Table, TableDefinition, TableFactory};
+use types::{
+    Catalog, DbError, Engine, Result, Table, TableDefinition, TableEntry, TableFactory, TableId,
+};
 use uuid::Uuid;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -131,6 +133,69 @@ impl DiskCatalog {
         Ok(catalog)
     }
 
+    /// Общая установка таблицы для CREATE и репликации.
+    fn install(&self, definition: TableDefinition, id: TableId, if_not_exists: bool) -> Result<()> {
+        definition.validate()?;
+        if definition.name.is_empty() {
+            return Err(DbError::Syntax("empty table name".into()));
+        }
+        let uuid = Uuid::parse_str(id.as_str()).map_err(|_| internal("invalid table id"))?;
+        if uuid.to_string() != id.as_str() {
+            return Err(internal("noncanonical table id"));
+        }
+        let mut tables = self
+            .tables
+            .write()
+            .map_err(|_| internal("catalog lock poisoned"))?;
+        if tables.contains_key(&definition.name) {
+            return if if_not_exists {
+                Ok(())
+            } else {
+                Err(DbError::TableExists(definition.name))
+            };
+        }
+        if tables.values().any(|entry| entry.stored.id == id.as_str()) {
+            return Err(internal("duplicate table id"));
+        }
+        let factory = self
+            .factories
+            .iter()
+            .find(|(engine, _)| *engine == definition.engine)
+            .ok_or_else(|| DbError::Unsupported("engine factory is not registered".into()))?;
+        let stored = StoredTable {
+            id: id.as_str().to_owned(),
+            definition,
+        };
+        let path = self.root.join("tables").join(&stored.id);
+        // Неактивный каталог мог остаться после неудачного DROP.
+        if path.exists() {
+            require_directory(&path)?;
+            fs::remove_dir_all(&path)?;
+        }
+        fs::create_dir(&path)?;
+        let result = (|| {
+            let table = factory.1.open(&stored.definition, &path)?;
+            File::open(self.root.join("tables"))?.sync_all()?;
+            let mut entries: Vec<_> = tables.values().map(|entry| entry.stored.clone()).collect();
+            entries.push(stored.clone());
+            entries.sort_by(|left, right| left.definition.name.cmp(&right.definition.name));
+            self.persist(&entries)?;
+            Ok(table)
+        })();
+        match result {
+            Ok(table) => {
+                tables.insert(stored.definition.name.clone(), Entry { stored, table });
+                Ok(())
+            }
+            Err(error) => {
+                if let Err(cleanup) = fs::remove_dir_all(&path) {
+                    tracing::warn!(%cleanup, ?path, "Не удалось удалить неопубликованную таблицу");
+                }
+                Err(error)
+            }
+        }
+    }
+
     fn persist(&self, tables: &[StoredTable]) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(&Manifest {
             version: 1,
@@ -171,53 +236,17 @@ impl DiskCatalog {
 
 impl Catalog for DiskCatalog {
     fn create_table(&self, definition: TableDefinition, if_not_exists: bool) -> Result<()> {
-        definition.validate()?;
-        if definition.name.is_empty() {
-            return Err(DbError::Syntax("empty table name".into()));
-        }
-        let mut tables = self
-            .tables
-            .write()
-            .map_err(|_| internal("catalog lock poisoned"))?;
-        if tables.contains_key(&definition.name) {
-            return if if_not_exists {
-                Ok(())
-            } else {
-                Err(DbError::TableExists(definition.name))
-            };
-        }
-        let factory = self
-            .factories
-            .iter()
-            .find(|(engine, _)| *engine == definition.engine)
-            .ok_or_else(|| DbError::Unsupported("engine factory is not registered".into()))?;
-        let stored = StoredTable {
-            id: Uuid::new_v4().to_string(),
-            definition,
-        };
-        let path = self.root.join("tables").join(&stored.id);
-        fs::create_dir(&path)?;
-        let result = (|| {
-            let table = factory.1.open(&stored.definition, &path)?;
-            File::open(self.root.join("tables"))?.sync_all()?;
-            let mut entries: Vec<_> = tables.values().map(|entry| entry.stored.clone()).collect();
-            entries.push(stored.clone());
-            entries.sort_by(|left, right| left.definition.name.cmp(&right.definition.name));
-            self.persist(&entries)?;
-            Ok(table)
-        })();
-        match result {
-            Ok(table) => {
-                tables.insert(stored.definition.name.clone(), Entry { stored, table });
-                Ok(())
-            }
-            Err(error) => {
-                if let Err(cleanup) = fs::remove_dir_all(&path) {
-                    tracing::warn!(%cleanup, ?path, "Не удалось удалить неопубликованную таблицу");
-                }
-                Err(error)
-            }
-        }
+        let id = TableId::new(Uuid::new_v4().to_string());
+        self.install(definition, id, if_not_exists)
+    }
+
+    fn create_table_with_id(
+        &self,
+        definition: TableDefinition,
+        id: TableId,
+        if_not_exists: bool,
+    ) -> Result<()> {
+        self.install(definition, id, if_not_exists)
     }
 
     fn drop_table(&self, name: &str, if_exists: bool) -> Result<()> {
@@ -269,5 +298,27 @@ impl Catalog for DiskCatalog {
             .values()
             .map(|entry| entry.stored.definition.clone())
             .collect()
+    }
+
+    fn table_entries(&self) -> Vec<TableEntry> {
+        self.tables
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(|entry| TableEntry {
+                id: TableId::new(entry.stored.id.clone()),
+                definition: entry.stored.definition.clone(),
+            })
+            .collect()
+    }
+
+    fn get_table_by_id(&self, id: &TableId) -> Result<Arc<dyn Table>> {
+        self.tables
+            .read()
+            .map_err(|_| internal("catalog lock poisoned"))?
+            .values()
+            .find(|entry| entry.stored.id == id.as_str())
+            .map(|entry| entry.table.clone())
+            .ok_or_else(|| DbError::UnknownTable(id.to_string()))
     }
 }

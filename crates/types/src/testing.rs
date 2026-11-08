@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::block::Block;
@@ -89,10 +90,21 @@ impl TableFactory for MemTableFactory {
     }
 }
 
-/// Каталог в памяти: любая таблица создаётся как MemTable, независимо от engine
-#[derive(Default)]
+type MemTableMap = BTreeMap<String, (TableId, Arc<dyn Table>)>;
+
+/// Каталог в памяти: любая таблица создаётся как MemTable, независимо от engine.
 pub struct MemCatalog {
-    tables: RwLock<BTreeMap<String, Arc<dyn Table>>>,
+    tables: RwLock<MemTableMap>,
+    next_id: AtomicU64,
+}
+
+impl Default for MemCatalog {
+    fn default() -> Self {
+        MemCatalog {
+            tables: RwLock::new(BTreeMap::new()),
+            next_id: AtomicU64::new(1),
+        }
+    }
 }
 
 impl MemCatalog {
@@ -103,6 +115,19 @@ impl MemCatalog {
 
 impl Catalog for MemCatalog {
     fn create_table(&self, definition: TableDefinition, if_not_exists: bool) -> Result<()> {
+        let id = TableId::new(format!(
+            "mem-{}",
+            self.next_id.fetch_add(1, Ordering::Relaxed)
+        ));
+        self.create_table_with_id(definition, id, if_not_exists)
+    }
+
+    fn create_table_with_id(
+        &self,
+        definition: TableDefinition,
+        id: TableId,
+        if_not_exists: bool,
+    ) -> Result<()> {
         definition.validate()?;
         let mut tables = self.tables.write().unwrap();
         if tables.contains_key(&definition.name) {
@@ -112,13 +137,17 @@ impl Catalog for MemCatalog {
                 Err(DbError::TableExists(definition.name))
             };
         }
-        tables.insert(definition.name.clone(), Arc::new(MemTable::new(definition)));
+        if tables.values().any(|(existing, _)| existing == &id) {
+            return Err(DbError::Internal("duplicate table id".into()));
+        }
+        let table = Arc::new(MemTable::new(definition.clone()));
+        tables.insert(definition.name, (id, table));
         Ok(())
     }
 
     fn drop_table(&self, name: &str, if_exists: bool) -> Result<()> {
         match self.tables.write().unwrap().remove(name) {
-            Some(t) => t.drop_data(),
+            Some((_, table)) => table.drop_data(),
             None if if_exists => Ok(()),
             None => Err(DbError::UnknownTable(name.to_string())),
         }
@@ -129,7 +158,7 @@ impl Catalog for MemCatalog {
             .read()
             .unwrap()
             .get(name)
-            .cloned()
+            .map(|(_, table)| table.clone())
             .ok_or_else(|| DbError::UnknownTable(name.to_string()))
     }
 
@@ -138,8 +167,30 @@ impl Catalog for MemCatalog {
             .read()
             .unwrap()
             .values()
-            .map(|t| t.definition().clone())
+            .map(|(_, table)| table.definition().clone())
             .collect()
+    }
+
+    fn table_entries(&self) -> Vec<TableEntry> {
+        self.tables
+            .read()
+            .unwrap()
+            .values()
+            .map(|(id, table)| TableEntry {
+                id: id.clone(),
+                definition: table.definition().clone(),
+            })
+            .collect()
+    }
+
+    fn get_table_by_id(&self, id: &TableId) -> Result<Arc<dyn Table>> {
+        self.tables
+            .read()
+            .unwrap()
+            .values()
+            .find(|(entry_id, _)| entry_id == id)
+            .map(|(_, table)| table.clone())
+            .ok_or_else(|| DbError::UnknownTable(id.to_string()))
     }
 }
 
@@ -147,23 +198,24 @@ impl Catalog for MemCatalog {
 /// Нужен, чтобы тестировать репликацию двумя каталогами в одном тесте.
 pub struct LocalPeer {
     pub catalog: Arc<dyn Catalog>,
+    pub identity: NodeIdentity,
 }
 
 impl Peer for LocalPeer {
-    fn ping(&self) -> Result<()> {
-        Ok(())
+    fn ping(&self) -> Result<NodeIdentity> {
+        Ok(self.identity.clone())
     }
 
-    fn list_tables(&self) -> Result<Vec<TableDefinition>> {
-        Ok(self.catalog.list_tables())
+    fn list_tables(&self) -> Result<Vec<TableEntry>> {
+        Ok(self.catalog.table_entries())
     }
 
-    fn list_parts(&self, table: &str) -> Result<Vec<String>> {
-        self.catalog.get_table(table)?.parts()
+    fn list_parts(&self, table: &TableId) -> Result<Vec<String>> {
+        self.catalog.get_table_by_id(table)?.parts()
     }
 
-    fn fetch_part(&self, table: &str, part: &str) -> Result<PartData> {
-        self.catalog.get_table(table)?.export_part(part)
+    fn fetch_part(&self, table: &TableId, part: &str) -> Result<PartData> {
+        self.catalog.get_table_by_id(table)?.export_part(part)
     }
 }
 

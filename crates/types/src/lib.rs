@@ -15,8 +15,8 @@ pub use column::ColumnData;
 pub use error::{DbError, Result};
 pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use interfaces::{
-    BlockStream, Catalog, PartData, Peer, QueryEngine, QueryOutput, ScanRequest, ScanStats, Table,
-    TableFactory,
+    BlockStream, Catalog, NodeIdentity, PartData, Peer, QueryEngine, QueryOutput, ScanRequest,
+    ScanStats, Table, TableEntry, TableFactory, TableId,
 };
 pub use key_condition::{may_match, KeyRange};
 pub use schema::{Codec, ColumnDef, Engine, TableDefinition, TableSchema, TableSettings};

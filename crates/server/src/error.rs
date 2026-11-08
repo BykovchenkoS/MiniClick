@@ -31,7 +31,7 @@ impl From<DbError> for ApiError {
     fn from(error: DbError) -> Self {
         let status = match &error {
             DbError::UnknownTable(_) => StatusCode::NOT_FOUND,
-            DbError::NotLeader { .. } => StatusCode::CONFLICT,
+            DbError::NotLeader { .. } | DbError::WrongLeader { .. } => StatusCode::CONFLICT,
             DbError::Io(_) | DbError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::BAD_REQUEST,
         };

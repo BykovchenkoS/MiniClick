@@ -20,6 +20,7 @@ utoipa.workspace = true
 utoipa-swagger-ui.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+reqwest.workspace = true
 
 [[bin]]
 name = "miniclick"
@@ -27,4 +28,3 @@ path = "src/main.rs"
 
 [dev-dependencies]
 tempfile.workspace = true
-reqwest.workspace = true

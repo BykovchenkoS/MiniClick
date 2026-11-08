@@ -17,10 +17,15 @@ impl Drop for Process {
 }
 impl Process {
     async fn start(root: &Path) -> Self {
-        let log = root.join("server.log");
+        Self::start_with(root, &[], "server.log").await
+    }
+
+    async fn start_with(root: &Path, extra: &[String], log_name: &str) -> Self {
+        let log = root.join(log_name);
         let child = Command::new(env!("CARGO_BIN_EXE_miniclick"))
             .args(["--listen-addr", "127.0.0.1:0", "--data-dir"])
             .arg(root.join("data"))
+            .args(extra.iter().map(String::as_str))
             .current_dir(root)
             .env("RUST_LOG", "info")
             .stdout(Stdio::null())
@@ -331,4 +336,317 @@ fn missing_registered_mergetree_manifest_fails_without_recreating_it() {
     std::fs::remove_file(&path).unwrap();
     assert!(server::AppState::open(config).is_err());
     assert!(!path.exists());
+}
+
+async fn try_sql(client: &Client, process: &Process, query: &str) -> Option<String> {
+    let response = client
+        .post(format!("{}/query", process.url))
+        .body(query.to_owned())
+        .send()
+        .await
+        .ok()?;
+    if response.status() != StatusCode::OK {
+        return None;
+    }
+    response.text().await.ok()
+}
+
+async fn wait_sql(client: &Client, process: &Process, query: &str, expected: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last = None;
+    loop {
+        if let Some(text) = try_sql(client, process, query).await {
+            if text == expected {
+                return;
+            }
+            last = Some(text);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "wait timeout for {query}: {last:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn try_parts(client: &Client, process: &Process) -> Option<u64> {
+    let response = client
+        .get(format!("{}/tables/hits", process.url))
+        .send()
+        .await
+        .ok()?;
+    if response.status() != StatusCode::OK {
+        return None;
+    }
+    let value: serde_json::Value = response.json().await.ok()?;
+    value["stats"]["parts_total"].as_u64()
+}
+
+async fn wait_parts(client: &Client, process: &Process, expected: u64) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last = None;
+    loop {
+        if let Some(parts) = try_parts(client, process).await {
+            if parts == expected {
+                return;
+            }
+            last = Some(parts);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "wait timeout for parts {expected}: {last:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn replica_follows_leader_after_optimize_restart_and_recreate() {
+    let leader_root = tempfile::tempdir().unwrap();
+    let replica_root = tempfile::tempdir().unwrap();
+    let client = client();
+
+    let leader = Process::start(leader_root.path()).await;
+    sql(
+        &client,
+        &leader,
+        "CREATE TABLE hits (id UInt64, text String) ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 2",
+    )
+    .await;
+    for body in ["3,c\n", "1,a\n2,b\n"] {
+        let response = client
+            .post(format!("{}/insert/hits", leader.url))
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    assert_eq!(stats(&client, &leader).await["parts_total"], 2);
+
+    let replica_args = vec![
+        "--cluster-id".to_owned(),
+        "miniclick".to_owned(),
+        "--role".to_owned(),
+        "Replica".to_owned(),
+        "--leader-addr".to_owned(),
+        leader.url.trim_start_matches("http://").to_owned(),
+        "--leader-id".to_owned(),
+        "node-1".to_owned(),
+        "--sync-interval-ms".to_owned(),
+        "50".to_owned(),
+    ];
+    let replica = Process::start_with(replica_root.path(), &replica_args, "replica.log").await;
+    wait_sql(
+        &client,
+        &replica,
+        "SELECT id, text FROM hits ORDER BY id",
+        "1\ta\n2\tb\n3\tc\n",
+    )
+    .await;
+    wait_parts(&client, &replica, 2).await;
+
+    let write = client
+        .post(format!("{}/insert/hits", replica.url))
+        .body("9,z\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(write.status(), StatusCode::CONFLICT);
+
+    sql(&client, &leader, "OPTIMIZE TABLE hits").await;
+    wait_parts(&client, &replica, 1).await;
+    assert_eq!(
+        sql(&client, &replica, "SELECT count() FROM hits").await,
+        "3\n"
+    );
+
+    sql(&client, &leader, "DROP TABLE hits").await;
+    sql(
+        &client,
+        &leader,
+        "CREATE TABLE hits (id UInt64, label String) ENGINE = MergeTree ORDER BY id",
+    )
+    .await;
+    let response = client
+        .post(format!("{}/insert/hits", leader.url))
+        .body("7,z\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    wait_sql(
+        &client,
+        &replica,
+        "SELECT id, label FROM hits ORDER BY id",
+        "7\tz\n",
+    )
+    .await;
+    assert_eq!(
+        sql(&client, &replica, "SELECT count() FROM hits").await,
+        "1\n"
+    );
+
+    replica.stop().await;
+    let replica = Process::start_with(replica_root.path(), &replica_args, "replica.log").await;
+    wait_sql(
+        &client,
+        &replica,
+        "SELECT id, label FROM hits ORDER BY id",
+        "7\tz\n",
+    )
+    .await;
+
+    leader.stop().await;
+    assert_eq!(
+        sql(&client, &replica, "SELECT id, label FROM hits ORDER BY id").await,
+        "7\tz\n"
+    );
+    replica.stop().await;
+}
+
+#[tokio::test]
+async fn replica_keeps_data_when_leader_identity_does_not_match() {
+    let leader_root = tempfile::tempdir().unwrap();
+    let replica_root = tempfile::tempdir().unwrap();
+    let foreign_root = tempfile::tempdir().unwrap();
+    let client = client();
+
+    let leader = Process::start(leader_root.path()).await;
+    sql(
+        &client,
+        &leader,
+        "CREATE TABLE hits (id UInt64) ENGINE = MergeTree ORDER BY id",
+    )
+    .await;
+    let response = client
+        .post(format!("{}/insert/hits", leader.url))
+        .body("1\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let replica_args = vec![
+        "--cluster-id".to_owned(),
+        "miniclick".to_owned(),
+        "--role".to_owned(),
+        "Replica".to_owned(),
+        "--leader-addr".to_owned(),
+        leader.url.trim_start_matches("http://").to_owned(),
+        "--leader-id".to_owned(),
+        "node-1".to_owned(),
+        "--sync-interval-ms".to_owned(),
+        "50".to_owned(),
+    ];
+    let replica = Process::start_with(replica_root.path(), &replica_args, "replica.log").await;
+    wait_sql(&client, &replica, "SELECT id FROM hits", "1\n").await;
+    replica.stop().await;
+    leader.stop().await;
+
+    let foreign = Process::start_with(
+        foreign_root.path(),
+        &[
+            "--cluster-id".to_owned(),
+            "other".to_owned(),
+            "--node-id".to_owned(),
+            "node-2".to_owned(),
+        ],
+        "foreign.log",
+    )
+    .await;
+    let foreign_args = vec![
+        "--cluster-id".to_owned(),
+        "miniclick".to_owned(),
+        "--role".to_owned(),
+        "Replica".to_owned(),
+        "--leader-addr".to_owned(),
+        foreign.url.trim_start_matches("http://").to_owned(),
+        "--leader-id".to_owned(),
+        "node-1".to_owned(),
+        "--sync-interval-ms".to_owned(),
+        "50".to_owned(),
+    ];
+    let replica = Process::start_with(replica_root.path(), &foreign_args, "replica.log").await;
+
+    // Чужой лидер пуст; при неверной идентичности реплика не должна ничего менять.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(sql(&client, &replica, "SELECT id FROM hits").await, "1\n");
+    assert_eq!(try_parts(&client, &replica).await, Some(1));
+
+    replica.stop().await;
+    foreign.stop().await;
+}
+
+#[tokio::test]
+async fn replica_catches_up_after_downtime_and_optimize() {
+    let leader_root = tempfile::tempdir().unwrap();
+    let replica_root = tempfile::tempdir().unwrap();
+    let client = client();
+
+    let leader = Process::start(leader_root.path()).await;
+    sql(
+        &client,
+        &leader,
+        "CREATE TABLE hits (id UInt64, text String) ENGINE = MergeTree ORDER BY id",
+    )
+    .await;
+    let response = client
+        .post(format!("{}/insert/hits", leader.url))
+        .body("1,a\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let replica_args = vec![
+        "--cluster-id".to_owned(),
+        "miniclick".to_owned(),
+        "--role".to_owned(),
+        "Replica".to_owned(),
+        "--leader-addr".to_owned(),
+        leader.url.trim_start_matches("http://").to_owned(),
+        "--leader-id".to_owned(),
+        "node-1".to_owned(),
+        "--sync-interval-ms".to_owned(),
+        "50".to_owned(),
+    ];
+    let replica = Process::start_with(replica_root.path(), &replica_args, "replica.log").await;
+    wait_sql(
+        &client,
+        &replica,
+        "SELECT id, text FROM hits ORDER BY id",
+        "1\ta\n",
+    )
+    .await;
+    replica.stop().await;
+
+    // Пока реплика выключена, лидер получает новые строки и объединяет parts.
+    for body in ["2,b\n", "3,c\n"] {
+        let response = client
+            .post(format!("{}/insert/hits", leader.url))
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    sql(&client, &leader, "OPTIMIZE TABLE hits").await;
+    assert_eq!(stats(&client, &leader).await["parts_total"], 1);
+
+    let replica = Process::start_with(replica_root.path(), &replica_args, "replica.log").await;
+    wait_sql(
+        &client,
+        &replica,
+        "SELECT id, text FROM hits ORDER BY id",
+        "1\ta\n2\tb\n3\tc\n",
+    )
+    .await;
+    assert_eq!(
+        sql(&client, &replica, "SELECT count() FROM hits").await,
+        "3\n"
+    );
+
+    replica.stop().await;
+    leader.stop().await;
 }

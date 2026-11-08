@@ -2,7 +2,7 @@ use catalog::DiskCatalog;
 use std::sync::Arc;
 use types::{
     testing::MemTableFactory, Catalog, ColumnDef, DataType, DbError, Engine, TableDefinition,
-    TableSchema, TableSettings,
+    TableId, TableSchema, TableSettings,
 };
 
 fn definition(name: &str) -> TableDefinition {
@@ -218,4 +218,57 @@ fn missing_manifest_does_not_import_existing_directories() {
     std::fs::create_dir_all(root.path().join("tables/standalone-storage")).unwrap();
     assert!(open(root.path()).is_err());
     assert!(!root.path().join("catalog.json").exists());
+}
+
+#[test]
+fn explicit_table_id_survives_restart_and_recreate() {
+    let root = tempfile::tempdir().unwrap();
+    let first = TableId::new("00000000-0000-4000-8000-000000000001");
+    let catalog = open(root.path()).unwrap();
+    catalog
+        .create_table_with_id(definition("a"), first.clone(), false)
+        .unwrap();
+    assert_eq!(catalog.table_entries()[0].id, first);
+    assert_eq!(
+        catalog.get_table_by_id(&first).unwrap().definition(),
+        &definition("a")
+    );
+    drop(catalog);
+
+    let catalog = open(root.path()).unwrap();
+    assert_eq!(catalog.table_entries()[0].id, first);
+    let second = TableId::new("00000000-0000-4000-8000-000000000002");
+    catalog.drop_table("a", false).unwrap();
+    catalog
+        .create_table_with_id(definition("a"), second.clone(), false)
+        .unwrap();
+    assert_eq!(catalog.table_entries()[0].id, second);
+    assert!(matches!(
+        catalog.get_table_by_id(&first),
+        Err(DbError::UnknownTable(_))
+    ));
+}
+
+#[test]
+fn invalid_duplicate_and_noncanonical_table_ids_are_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let catalog = open(root.path()).unwrap();
+    assert!(catalog
+        .create_table_with_id(definition("a"), TableId::new("not-a-uuid"), false)
+        .is_err());
+    assert!(catalog
+        .create_table_with_id(
+            definition("a"),
+            TableId::new("00000000-0000-4000-8000-00000000000A"),
+            false
+        )
+        .is_err());
+
+    let id = TableId::new("00000000-0000-4000-8000-000000000003");
+    catalog
+        .create_table_with_id(definition("a"), id.clone(), false)
+        .unwrap();
+    assert!(catalog
+        .create_table_with_id(definition("b"), id, false)
+        .is_err());
 }

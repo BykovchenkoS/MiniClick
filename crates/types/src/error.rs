@@ -19,6 +19,11 @@ pub enum DbError {
     NotLeader {
         leader: String,
     },
+    /// Узел ответил идентичностью другого кластера или другого лидера
+    WrongLeader {
+        expected: String,
+        actual: String,
+    },
     Io(std::io::Error),
     /// Нарушен инвариант внутри системы — это баг
     Internal(String),
@@ -38,6 +43,9 @@ impl fmt::Display for DbError {
             DbError::Unsupported(m) => write!(f, "not supported: {m}"),
             DbError::NotLeader { leader } => {
                 write!(f, "this node is a replica, send writes to leader {leader}")
+            }
+            DbError::WrongLeader { expected, actual } => {
+                write!(f, "unexpected leader: expected {expected}, got {actual}")
             }
             DbError::Io(e) => write!(f, "io error: {e}"),
             DbError::Internal(m) => write!(f, "internal error: {m}"),

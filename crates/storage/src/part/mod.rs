@@ -11,6 +11,7 @@ use std::sync::{
 use types::{Block, Column, ColumnData, DbError, Engine, Result, TableDefinition, Value};
 
 use crate::format::{self, Mark, PartMeta, FORMAT_VERSION};
+use sha2::{Digest, Sha256};
 
 pub(crate) fn internal(message: impl Into<String>) -> DbError {
     DbError::Internal(message.into())
@@ -130,6 +131,23 @@ pub(crate) fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
+}
+
+/// SHA-256 файлов в заданном порядке; имена и длины тоже входят в хеш.
+/// Порядок файлов — часть контрольной суммы, его сохраняет `PartData`.
+pub(crate) fn part_checksum(files: &[(String, Vec<u8>)]) -> String {
+    let mut hasher = Sha256::new();
+    for (name, data) in files {
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update((data.len() as u64).to_le_bytes());
+        hasher.update(data);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 struct ColumnWriter {

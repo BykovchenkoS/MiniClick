@@ -1,14 +1,17 @@
 //! Снимки активных parts и атомарное сохранение набора на диске.
 
-use crate::part::{internal, sync_directory, validate_definition, write_file, DataPart};
+use crate::part::{
+    internal, part_checksum, sync_directory, validate_definition, write_file, DataPart,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, RwLock,
 };
-use types::{Result, TableDefinition};
+use types::{PartData, Result, TableDefinition};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct PartId {
@@ -294,6 +297,108 @@ impl PartRepository {
         state.parts.clear();
         Ok(())
     }
+
+    /// Устанавливает импортированные parts и удаляет указанные атомарно.
+    /// При ошибке активный набор остаётся прежним.
+    pub fn import(&self, add: Vec<PartData>, remove: &[String]) -> Result<()> {
+        self.check_live()?;
+        let removed: Vec<PartId> = remove
+            .iter()
+            .map(|name| PartId::parse(name))
+            .collect::<Result<_>>()?;
+        if add.is_empty() && removed.is_empty() {
+            return Ok(());
+        }
+        let mut additions = Vec::with_capacity(add.len());
+        // Созданные каталоги удаляются при любой ошибке до публикации.
+        let mut created = Vec::new();
+        let result = (|| {
+            let mut ids = BTreeSet::new();
+            for part in &add {
+                let id = validate_import(&self.definition, part)?;
+                if !ids.insert(id) {
+                    return Err(internal("duplicate part in import"));
+                }
+            }
+            for part in &add {
+                let id = PartId::parse(&part.name)?;
+                let target = self.root.join(&part.name);
+                let temporary = self.root.join(format!("tmp_{}", part.name));
+                if target.exists() {
+                    return Err(internal("part already exists"));
+                }
+                if temporary.exists() {
+                    return Err(internal("temporary part already exists"));
+                }
+                fs::create_dir(&temporary)?;
+                created.push(temporary.clone());
+                for (name, bytes) in &part.files {
+                    write_file(&temporary.join(name), bytes)?;
+                }
+                sync_directory(&temporary)?;
+                fs::rename(&temporary, &target)?;
+                created.push(target.clone());
+                sync_directory(&self.root)?;
+                additions.push((id, self.open_part(id)?));
+            }
+            self.replace(additions, &removed)
+        })();
+        if result.is_err() {
+            for path in &created {
+                if let Err(error) = fs::remove_dir_all(path) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(?path, %error, "Не удалось удалить неопубликованный импорт part");
+                    }
+                }
+            }
+        }
+        result
+    }
+}
+
+fn validate_import(definition: &TableDefinition, part: &PartData) -> Result<PartId> {
+    let id = PartId::parse(&part.name)?;
+    if part.checksum != part_checksum(&part.files) {
+        return Err(internal(format!(
+            "part checksum mismatch for {}",
+            part.name
+        )));
+    }
+    let mut expected = BTreeSet::new();
+    expected.insert("part.json".to_owned());
+    expected.insert("primary.idx".to_owned());
+    for column in &definition.schema.columns {
+        expected.insert(format!("{}.mrk", column.name));
+        expected.insert(format!("{}.bin", column.name));
+    }
+    let mut seen = BTreeSet::new();
+    for (name, _) in &part.files {
+        if !is_safe_file_name(name) {
+            return Err(internal(format!("unsafe part file name: {name}")));
+        }
+        if !expected.contains(name) {
+            return Err(internal(format!("unexpected part file: {name}")));
+        }
+        if !seen.insert(name.as_str()) {
+            return Err(internal(format!("duplicate part file: {name}")));
+        }
+    }
+    // Все просмотренные имена входят в expected, поэтому равенство размеров
+    // означает, что присутствуют ровно все необходимые файлы.
+    if seen.len() != expected.len() {
+        return Err(internal("part is missing required files"));
+    }
+    Ok(id)
+}
+
+/// Имена файлов приходят из сети, поэтому допускаем только один безопасный компонент пути.
+fn is_safe_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\', '\0'])
+        && Path::new(name).is_relative()
+        && Path::new(name).components().count() == 1
 }
 
 fn persist(root: &Path, manifest: &Manifest) -> Result<()> {

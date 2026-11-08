@@ -2,7 +2,9 @@ use reqwest::{Client, StatusCode};
 use server::{config::Config, AppState};
 use std::sync::Arc;
 use tokio::{sync::oneshot, task::JoinHandle};
-use types::{Block, Column, ColumnData, ColumnDef, DataType, DbError, QueryEngine, QueryOutput};
+use types::{
+    Block, Column, ColumnData, ColumnDef, DataType, DbError, Peer, QueryEngine, QueryOutput,
+};
 
 struct TestServer {
     url: String,
@@ -374,6 +376,10 @@ async fn openapi_matches_routes_formats_binary_upload_and_vendored_assets() {
         ("/tables/{name}", "get"),
         ("/insert/{table}", "post"),
         ("/query", "post"),
+        ("/replica/ping", "get"),
+        ("/replica/tables", "get"),
+        ("/replica/tables/{id}/parts", "get"),
+        ("/replica/tables/{id}/parts/{part}", "get"),
     ] {
         assert!(doc["paths"][path][method].is_object(), "{path}");
     }
@@ -629,4 +635,206 @@ async fn actual_late_storage_errors_do_not_leak_sorted_or_aggregated_results() {
         "40\n"
     );
     server.close().await;
+}
+
+#[tokio::test]
+async fn replica_endpoints_and_http_peer_preserve_parts() {
+    let root = tempfile::tempdir().unwrap();
+    let app = state(root.path());
+    let catalog = app.catalog.clone();
+    let server = TestServer::start(app).await;
+    let client = client();
+    sql(
+        &client,
+        &server,
+        "CREATE TABLE hits (id UInt64, text String) ENGINE = MergeTree ORDER BY id",
+    )
+    .await;
+    let response = client
+        .post(format!("{}/insert/hits", server.url))
+        .body("3,c\n1,a\n2,b\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let id = catalog
+        .table_entries()
+        .into_iter()
+        .find(|entry| entry.definition.name == "hits")
+        .unwrap()
+        .id;
+    let table = catalog.get_table("hits").unwrap();
+    let expected = table.export_part("all_1_1_0").unwrap();
+
+    let url = server.url.clone();
+    let peer_id = id.clone();
+    let (tables, parts, fetched) = tokio::task::spawn_blocking(move || {
+        let peer = server::replica::HttpPeer::new(&url).unwrap();
+        assert_eq!(
+            peer.ping().unwrap(),
+            types::NodeIdentity {
+                cluster_id: "miniclick".into(),
+                node_id: "node-1".into(),
+            }
+        );
+        let tables = peer.list_tables().unwrap();
+        let parts = peer.list_parts(&peer_id).unwrap();
+        let fetched = peer.fetch_part(&peer_id, &parts[0]).unwrap();
+        (tables, parts, fetched)
+    })
+    .await
+    .unwrap();
+    assert!(tables.iter().any(|entry| entry.definition.name == "hits"));
+    assert_eq!(parts, ["all_1_1_0"]);
+    assert_eq!(fetched, expected);
+
+    let raw = client
+        .get(format!(
+            "{}/replica/tables/{}/parts/all_1_1_0",
+            server.url, id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(raw.status(), StatusCode::OK);
+    assert_eq!(raw.headers()["content-type"], "application/octet-stream");
+    assert_eq!(&raw.bytes().await.unwrap()[..4], b"MCP1");
+
+    let missing = client
+        .get(format!("{}/replica/tables/missing/parts", server.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    server.close().await;
+}
+
+#[tokio::test]
+async fn replica_rejects_writes_but_allows_reads() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = Config {
+        data_dir: root.path().to_owned(),
+        ..Config::default()
+    };
+    config.node.role = replication::Role::Replica {
+        leader_addr: "127.0.0.1:18123".into(),
+        leader_id: "leader-1".into(),
+    };
+    let app = AppState::open(config).unwrap();
+    app.query
+        .execute("CREATE TABLE hits (id UInt64) ENGINE = Memory")
+        .unwrap();
+    let server = TestServer::start(app).await;
+    let client = client();
+
+    let replica_endpoint = client
+        .get(format!("{}/replica/ping", server.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replica_endpoint.status(), StatusCode::NOT_FOUND);
+
+    let response = client
+        .post(format!("{}/insert/hits", server.url))
+        .body("1\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error: serde_json::Value = response.json().await.unwrap();
+    assert!(error["error"].as_str().unwrap().contains("127.0.0.1:18123"));
+
+    for query in [
+        "CREATE TABLE other (id UInt64) ENGINE = Memory",
+        "DROP TABLE hits",
+        "OPTIMIZE TABLE hits",
+    ] {
+        let response = client
+            .post(format!("{}/query", server.url))
+            .body(query)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{query}");
+        assert!(response.json::<serde_json::Value>().await.unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .contains("127.0.0.1:18123"));
+    }
+
+    assert_eq!(sql(&client, &server, "SELECT * FROM hits").await, "");
+    let explain = sql(&client, &server, "EXPLAIN SELECT * FROM hits").await;
+    assert!(explain.contains("Scan"));
+    server.close().await;
+}
+
+#[tokio::test]
+async fn replica_sync_loop_pulls_table_and_parts_from_leader() {
+    let leader_root = tempfile::tempdir().unwrap();
+    let leader = TestServer::start(state(leader_root.path())).await;
+    let client = client();
+    sql(
+        &client,
+        &leader,
+        "CREATE TABLE hits (id UInt64, text String) ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 2",
+    )
+    .await;
+    let response = client
+        .post(format!("{}/insert/hits", leader.url))
+        .body("2,b\n1,a\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let replica_root = tempfile::tempdir().unwrap();
+    let mut config = Config {
+        data_dir: replica_root.path().to_owned(),
+        ..Config::default()
+    };
+    config.node.role = replication::Role::Replica {
+        leader_addr: leader.url.trim_start_matches("http://").to_owned(),
+        leader_id: "node-1".into(),
+    };
+    let replica = AppState::open(config).unwrap();
+    let catalog = replica.catalog.clone();
+    let leader_url = leader.url.clone();
+    let (stop, stopped) = std::sync::mpsc::channel();
+    let sync = tokio::task::spawn_blocking(move || {
+        server::replica::sync_loop(
+            catalog,
+            leader_url,
+            types::NodeIdentity {
+                cluster_id: "miniclick".into(),
+                node_id: "node-1".into(),
+            },
+            std::time::Duration::from_millis(20),
+            stopped,
+        );
+    });
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Ok(table) = replica.catalog.get_table("hits") {
+            if !table.parts().unwrap().is_empty() {
+                break;
+            }
+        }
+        assert!(tokio::time::Instant::now() < deadline, "sync timeout");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let _ = stop.send(());
+    sync.await.unwrap();
+
+    let QueryOutput::Rows { stream, .. } = replica
+        .query
+        .execute("SELECT id, text FROM hits ORDER BY id")
+        .unwrap()
+    else {
+        panic!("expected rows");
+    };
+    let blocks: Vec<Block> = stream.collect::<types::Result<_>>().unwrap();
+    let block = Block::concat(&blocks).unwrap();
+    assert_eq!(block.column("id"), Some(&ColumnData::UInt64(vec![1, 2])));
+    leader.close().await;
 }

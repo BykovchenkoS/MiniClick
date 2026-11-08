@@ -37,8 +37,13 @@ fn invalid_configuration_fails_instead_of_silently_falling_back() {
         "listen_addr = 'localhost'",
         "max_body_bytes = 0",
         "node_id = ''",
+        "cluster_id = ''",
         "data_dir = ''",
         "role = 'Replica'",
+        "role = 'Replica'\nleader_addr = '127.0.0.1:9001'",
+        "role = 'Replica'\nleader_addr = 'localhost'\nleader_id = 'leader-1'",
+        "role = 'Replica'\nleader_addr = '127.0.0.1:9001'\nleader_id = 'leader-1'\nsync_interval_ms = 0",
+        "role = 'unknown'",
         "unknown = 42",
         "index_granularity = 64",
         "not toml",
@@ -46,4 +51,24 @@ fn invalid_configuration_fails_instead_of_silently_falling_back() {
         std::fs::write(root.path().join("config.toml"), config).unwrap();
         assert!(Config::load(cli(&[]), root.path()).is_err(), "{config}");
     }
+}
+
+#[test]
+fn replica_role_parses_identity_and_sync_interval() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("config.toml"),
+        "cluster_id = 'cluster-1'\nrole = 'Replica'\nleader_addr = '127.0.0.1:9001'\nleader_id = 'leader-1'\nsync_interval_ms = 250\n",
+    )
+    .unwrap();
+    let config = Config::load(cli(&[]), root.path()).unwrap();
+    assert_eq!(config.node.cluster_id, "cluster-1");
+    assert_eq!(
+        config.node.role,
+        replication::Role::Replica {
+            leader_addr: "127.0.0.1:9001".into(),
+            leader_id: "leader-1".into(),
+        }
+    );
+    assert_eq!(config.node.sync_interval_ms, 250);
 }

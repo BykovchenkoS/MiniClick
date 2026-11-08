@@ -2,6 +2,12 @@
 listen_addr = "127.0.0.1:8123"
 data_dir = "./data"
 node_id = "node-1"
+# Общий идентификатор кластера у лидера и всех его реплик.
+cluster_id = "miniclick"
 role = "Leader"
+# Для реплики: role = "Replica", leader_addr = "127.0.0.1:8123",
+# leader_id = "node-1" (ожидаемый node_id лидера).
+# sync_interval_ms задаёт период сверки реплики с лидером.
+sync_interval_ms = 1000
 max_body_bytes = 268435456
 # Размер гранулы и кодек пока задаются только в CREATE TABLE ... SETTINGS.
