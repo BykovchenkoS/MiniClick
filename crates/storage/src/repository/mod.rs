@@ -300,28 +300,27 @@ impl PartRepository {
 
     /// Устанавливает импортированные parts и удаляет указанные атомарно.
     /// При ошибке активный набор остаётся прежним.
-    pub fn import(&self, add: Vec<PartData>, remove: &[String]) -> Result<()> {
+    pub fn import(
+        &self,
+        add: &mut dyn Iterator<Item = Result<PartData>>,
+        remove: &[String],
+    ) -> Result<()> {
         self.check_live()?;
         let removed: Vec<PartId> = remove
             .iter()
             .map(|name| PartId::parse(name))
             .collect::<Result<_>>()?;
-        if add.is_empty() && removed.is_empty() {
-            return Ok(());
-        }
-        let mut additions = Vec::with_capacity(add.len());
+        let mut additions = Vec::new();
         // Созданные каталоги удаляются при любой ошибке до публикации.
         let mut created = Vec::new();
         let result = (|| {
             let mut ids = BTreeSet::new();
-            for part in &add {
-                let id = validate_import(&self.definition, part)?;
+            for part in add {
+                let part = part?;
+                let id = validate_import(&self.definition, &part)?;
                 if !ids.insert(id) {
                     return Err(internal("duplicate part in import"));
                 }
-            }
-            for part in &add {
-                let id = PartId::parse(&part.name)?;
                 let target = self.root.join(&part.name);
                 let temporary = self.root.join(format!("tmp_{}", part.name));
                 if target.exists() {
@@ -340,6 +339,9 @@ impl PartRepository {
                 created.push(target.clone());
                 sync_directory(&self.root)?;
                 additions.push((id, self.open_part(id)?));
+            }
+            if additions.is_empty() && removed.is_empty() {
+                return Ok(());
             }
             self.replace(additions, &removed)
         })();

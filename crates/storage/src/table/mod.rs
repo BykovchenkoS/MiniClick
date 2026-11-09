@@ -188,6 +188,14 @@ impl Table for MergeTreeTable {
     }
 
     fn sync_parts(&self, add: Vec<PartData>, remove: &[String]) -> Result<()> {
+        self.sync_parts_stream(&mut add.into_iter().map(Ok), remove)
+    }
+
+    fn sync_parts_stream(
+        &self,
+        add: &mut dyn Iterator<Item = Result<PartData>>,
+        remove: &[String],
+    ) -> Result<()> {
         let _guard = self
             .write_lock
             .lock()

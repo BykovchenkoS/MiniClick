@@ -81,6 +81,17 @@ pub trait Table: Send + Sync {
     fn sync_parts(&self, _add: Vec<PartData>, _remove: &[String]) -> Result<()> {
         Err(DbError::Unsupported("table is not replicable".into()))
     }
+
+    /// Установить лениво получаемые parts одним атомарным изменением набора.
+    /// MergeTree пишет каждую часть на диск до получения следующей; ошибка
+    /// итератора отменяет весь импорт. Базовая реализация сохраняет совместимость.
+    fn sync_parts_stream(
+        &self,
+        add: &mut dyn Iterator<Item = Result<PartData>>,
+        remove: &[String],
+    ) -> Result<()> {
+        self.sync_parts(add.collect::<Result<Vec<_>>>()?, remove)
+    }
 }
 
 /// Part целиком: имя и файлы из его каталога (part.json, *.bin, *.mrk, primary.idx).

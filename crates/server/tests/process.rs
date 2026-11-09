@@ -650,3 +650,37 @@ async fn replica_catches_up_after_downtime_and_optimize() {
     replica.stop().await;
     leader.stop().await;
 }
+
+#[tokio::test]
+async fn replica_sigterm_cancels_a_leader_that_never_answers() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let (accepted, connected) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let blackhole = std::thread::spawn(move || {
+        let (connection, _) = listener.accept().unwrap();
+        accepted.send(()).unwrap();
+        let _ = released.recv_timeout(Duration::from_secs(20));
+        drop(connection);
+    });
+    let args = vec![
+        "--role".into(),
+        "Replica".into(),
+        "--leader-addr".into(),
+        address,
+        "--leader-id".into(),
+        "node-1".into(),
+    ];
+    let replica = Process::start_with(root.path(), &args, "replica.log").await;
+    connected.recv_timeout(Duration::from_secs(5)).unwrap();
+    let start = Instant::now();
+    replica.stop().await;
+    let elapsed = start.elapsed();
+    let _ = release.send(());
+    blackhole.join().unwrap();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "SIGTERM занял {elapsed:?}"
+    );
+}

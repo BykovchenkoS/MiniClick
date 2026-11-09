@@ -184,3 +184,109 @@ fn failed_import_keeps_active_parts_unchanged() {
     assert_eq!(dest.parts().unwrap(), before_parts);
     assert!(!dest_root.path().join("all_3_3_0").exists());
 }
+
+#[test]
+fn streamed_import_stages_before_next_fetch_and_rolls_back_on_network_error() {
+    let source_root = tempfile::tempdir().unwrap();
+    let dest_root = tempfile::tempdir().unwrap();
+    let def = definition(Codec::Lz4);
+    let source = MergeTreeTable::open(&def, source_root.path()).unwrap();
+    source.insert(block(&[1], &["old"])).unwrap();
+    source.insert(block(&[2], &["two"])).unwrap();
+    source.insert(block(&[3], &["three"])).unwrap();
+    let dest = MergeTreeTable::open(&def, dest_root.path()).unwrap();
+    dest.insert(block(&[1], &["old"])).unwrap();
+    let before = dest.parts().unwrap();
+    let mut step = 0;
+    let mut interrupted = std::iter::from_fn(|| {
+        assert_eq!(dest.parts().unwrap(), before);
+        step += 1;
+        match step {
+            1 => Some(source.export_part("all_2_2_0")),
+            2 => {
+                // Первая часть уже на диске, но ещё не видна читателям.
+                assert!(dest_root.path().join("all_2_2_0").is_dir());
+                Some(Err(std::io::Error::other("connection lost").into()))
+            }
+            _ => None,
+        }
+    });
+    assert!(dest.sync_parts_stream(&mut interrupted, &before).is_err());
+    assert_eq!(dest.parts().unwrap(), before);
+    assert_eq!(rows(&dest, &def), block(&[1], &["old"]));
+    assert!(!dest_root.path().join("all_2_2_0").exists());
+    assert!(!dest_root.path().join("tmp_all_2_2_0").exists());
+
+    let old_reader = dest
+        .scan(&ScanRequest {
+            columns: def.schema.names(),
+            predicate: None,
+        })
+        .unwrap();
+    let mut retry = ["all_2_2_0", "all_3_3_0"]
+        .into_iter()
+        .map(|name| source.export_part(name));
+    dest.sync_parts_stream(&mut retry, &before).unwrap();
+    assert_eq!(rows(&dest, &def), block(&[2, 3], &["two", "three"]));
+    let old: Vec<_> = old_reader.collect::<Result<_>>().unwrap();
+    assert_eq!(Block::concat(&old).unwrap(), block(&[1], &["old"]));
+    drop(dest);
+    let reopened = MergeTreeTable::open(&def, dest_root.path()).unwrap();
+    assert_eq!(rows(&reopened, &def), block(&[2, 3], &["two", "three"]));
+}
+
+#[test]
+fn crash_during_streamed_import_process() {
+    let Ok(root) = std::env::var("MINICLICK_IMPORT_CRASH_ROOT") else {
+        return;
+    };
+    let root = Path::new(&root);
+    let def = definition(Codec::Lz4);
+    let source = MergeTreeTable::open(&def, &root.join("source")).unwrap();
+    source.insert(block(&[1], &["old"])).unwrap();
+    source.insert(block(&[2], &["new"])).unwrap();
+    let dest = MergeTreeTable::open(&def, &root.join("replica")).unwrap();
+    dest.insert(block(&[1], &["old"])).unwrap();
+    let mut fetched = false;
+    let mut download = std::iter::from_fn(|| {
+        if fetched {
+            assert!(root.join("replica/all_2_2_0").is_dir());
+            // Имитируем падение после записи part, но до публикации manifest.
+            std::process::exit(0);
+        }
+        fetched = true;
+        Some(source.export_part("all_2_2_0"))
+    });
+    dest.sync_parts_stream(&mut download, &["all_1_1_0".into()])
+        .unwrap();
+    panic!("Дочерний процесс не достиг точки падения");
+}
+
+#[test]
+fn restart_discards_staged_import_after_abrupt_process_exit_and_allows_retry() {
+    let root = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "table::tests::crash_during_streamed_import_process",
+            "--nocapture",
+        ])
+        .env("MINICLICK_IMPORT_CRASH_ROOT", root.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(root.path().join("replica/all_2_2_0").exists());
+    let def = definition(Codec::Lz4);
+    let dest = MergeTreeTable::open(&def, &root.path().join("replica")).unwrap();
+    assert_eq!(rows(&dest, &def), block(&[1], &["old"]));
+    assert!(!root.path().join("replica/all_2_2_0").exists());
+    let source = MergeTreeTable::open(&def, &root.path().join("source")).unwrap();
+    let mut retry = std::iter::once_with(|| source.export_part("all_2_2_0"));
+    dest.sync_parts_stream(&mut retry, &["all_1_1_0".into()])
+        .unwrap();
+    assert_eq!(rows(&dest, &def), block(&[2], &["new"]));
+}

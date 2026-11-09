@@ -6,10 +6,9 @@ use axum::extract::{rejection::PathRejection, Path, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use reqwest::blocking::Client;
+use reqwest::Client;
 use reqwest::Url;
-use std::io::Read;
-use std::sync::mpsc::RecvTimeoutError;
+use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use std::time::Duration;
 use types::{
@@ -91,11 +90,46 @@ pub async fn part(
 pub struct HttpPeer {
     base: Url,
     client: Client,
+    runtime: tokio::runtime::Runtime,
+    cancellation: Arc<Cancellation>,
+}
+
+/// Сигнал сохраняется для будущих ожиданий и пробуждает текущий HTTP-запрос.
+struct Cancellation {
+    signal: tokio::sync::watch::Sender<bool>,
+}
+
+impl Cancellation {
+    fn new() -> Self {
+        Self {
+            signal: tokio::sync::watch::channel(false).0,
+        }
+    }
+
+    fn cancel(&self) {
+        self.signal.send_replace(true);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        *self.signal.borrow()
+    }
+
+    async fn cancelled(&self) {
+        let mut receiver = self.signal.subscribe();
+        let cancelled = *receiver.borrow();
+        if !cancelled {
+            let _ = receiver.changed().await;
+        }
+    }
 }
 
 impl HttpPeer {
     /// `base` — полный URL лидера, например `http://127.0.0.1:8123`.
     pub fn new(base: &str) -> DbResult<HttpPeer> {
+        Self::with_cancellation(base, Arc::new(Cancellation::new()))
+    }
+
+    fn with_cancellation(base: &str, cancellation: Arc<Cancellation>) -> DbResult<HttpPeer> {
         let base = Url::parse(base)
             .map_err(|error| DbError::Syntax(format!("invalid leader URL: {error}")))?;
         if base.scheme() != "http" {
@@ -105,7 +139,15 @@ impl HttpPeer {
             .timeout(Duration::from_secs(300))
             .build()
             .map_err(|error| DbError::Internal(format!("HTTP client: {error}")))?;
-        Ok(HttpPeer { base, client })
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        Ok(HttpPeer {
+            base,
+            client,
+            runtime,
+            cancellation,
+        })
     }
 
     /// Принимает адрес в виде `host:port` или полный URL.
@@ -132,15 +174,40 @@ impl HttpPeer {
         Ok(url)
     }
 
-    fn get(&self, url: Url) -> DbResult<reqwest::blocking::Response> {
+    /// Отмена охватывает и установление соединения, и чтение тела ответа.
+    fn run<T>(&self, request: impl std::future::Future<Output = DbResult<T>>) -> DbResult<T> {
+        self.runtime.block_on(async {
+            tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted, "replication cancelled"
+                ).into()),
+                result = request => result,
+            }
+        })
+    }
+
+    fn json<T: DeserializeOwned>(&self, segments: &[&str], kind: &str) -> DbResult<T> {
+        let url = self.url(segments)?;
+        self.run(async {
+            self.get(url)
+                .await?
+                .json()
+                .await
+                .map_err(|error| DbError::Internal(format!("invalid {kind} response: {error}")))
+        })
+    }
+
+    async fn get(&self, url: Url) -> DbResult<reqwest::Response> {
         let response = self
             .client
             .get(url)
             .send()
+            .await
             .map_err(|error| DbError::Io(std::io::Error::other(error)))?;
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().unwrap_or_default();
+            let body = response.text().await.unwrap_or_default();
             return Err(DbError::Internal(format!(
                 "leader returned {status}: {}",
                 body.trim()
@@ -152,41 +219,42 @@ impl HttpPeer {
 
 impl Peer for HttpPeer {
     fn ping(&self) -> DbResult<NodeIdentity> {
-        self.get(self.url(&["replica", "ping"])?)?
-            .json()
-            .map_err(|error| DbError::Internal(format!("invalid identity response: {error}")))
+        self.json(&["replica", "ping"], "identity")
     }
 
     fn list_tables(&self) -> DbResult<Vec<TableEntry>> {
-        self.get(self.url(&["replica", "tables"])?)?
-            .json()
-            .map_err(|error| DbError::Internal(format!("invalid tables response: {error}")))
+        self.json(&["replica", "tables"], "tables")
     }
 
     fn list_parts(&self, table: &TableId) -> DbResult<Vec<String>> {
-        self.get(self.url(&["replica", "tables", table.as_str(), "parts"])?)?
-            .json()
-            .map_err(|error| DbError::Internal(format!("invalid parts response: {error}")))
+        self.json(&["replica", "tables", table.as_str(), "parts"], "parts")
     }
 
     fn fetch_part(&self, table: &TableId, part: &str) -> DbResult<PartData> {
-        let response =
-            self.get(self.url(&["replica", "tables", table.as_str(), "parts", part])?)?;
-        if let Some(len) = response.content_length() {
-            if len > MAX_PART_BYTES {
-                return Err(DbError::Internal(format!(
-                    "part response is too large: {len} bytes"
-                )));
+        let url = self.url(&["replica", "tables", table.as_str(), "parts", part])?;
+        self.run(async {
+            let mut response = self.get(url).await?;
+            if response
+                .content_length()
+                .is_some_and(|len| len > MAX_PART_BYTES)
+            {
+                return Err(DbError::Internal("part response is too large".into()));
             }
-        }
-        let mut bytes = Vec::new();
-        let read = response.take(MAX_PART_BYTES + 1).read_to_end(&mut bytes)?;
-        if read as u64 > MAX_PART_BYTES {
-            return Err(DbError::Internal(
-                "part response exceeds the size limit".into(),
-            ));
-        }
-        decode_part(&bytes)
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|error| DbError::Io(std::io::Error::other(error)))?
+            {
+                if chunk.len() as u64 > MAX_PART_BYTES - bytes.len() as u64 {
+                    return Err(DbError::Internal(
+                        "part response exceeds the size limit".into(),
+                    ));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            decode_part(&bytes)
+        })
     }
 }
 
@@ -199,15 +267,33 @@ pub fn sync_loop(
     interval: Duration,
     stop: std::sync::mpsc::Receiver<()>,
 ) {
-    let peer = match HttpPeer::from_addr(&leader_addr) {
+    let cancellation = Arc::new(Cancellation::new());
+    let base = if leader_addr.contains("://") {
+        leader_addr.clone()
+    } else {
+        format!("http://{leader_addr}")
+    };
+    let peer = match HttpPeer::with_cancellation(&base, cancellation.clone()) {
         Ok(peer) => peer,
         Err(error) => {
             tracing::error!(%error, %leader_addr, "Реплика не смогла создать клиента лидера");
             return;
         }
     };
-    loop {
-        match replication::sync_once(catalog.as_ref(), &peer, &expected) {
+    let cancel_on_stop = cancellation.clone();
+    let watcher = std::thread::spawn(move || {
+        let _ = stop.recv();
+        cancel_on_stop.cancel();
+    });
+    while !cancellation.is_cancelled() {
+        let result =
+            replication::sync_once_with_cancel(catalog.as_ref(), &peer, &expected, &|| {
+                cancellation.is_cancelled()
+            });
+        if cancellation.is_cancelled() {
+            break;
+        }
+        match result {
             Ok(report) if report.failures > 0 => tracing::warn!(
                 created = report.tables_created,
                 dropped = report.tables_dropped,
@@ -225,10 +311,18 @@ pub fn sync_loop(
             ),
             Err(error) => tracing::warn!(%error, "Синхронизация с лидером не удалась"),
         }
-        match stop.recv_timeout(interval) {
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
-            Err(RecvTimeoutError::Timeout) => {}
+        if peer
+            .run(async {
+                tokio::time::sleep(interval).await;
+                Ok(())
+            })
+            .is_err()
+        {
+            break;
         }
+    }
+    if watcher.join().is_err() {
+        tracing::error!("Поток остановки реплики завершился с ошибкой");
     }
 }
 

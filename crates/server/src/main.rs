@@ -19,6 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load(Cli::parse(), &std::env::current_dir()?)?;
     let address = config.node.listen_addr.clone();
     let state = tokio::task::spawn_blocking(move || AppState::open(config)).await??;
+    let listener = tokio::net::TcpListener::bind(&address).await?;
     let mut sync_task = None;
     if let replication::Role::Replica {
         leader_addr,
@@ -42,7 +43,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }),
         ));
     }
-    let listener = tokio::net::TcpListener::bind(&address).await?;
     tracing::info!(address = %listener.local_addr()?, node_id = %state.config.node.node_id, "MiniClick запущен");
     let served = axum::serve(listener, server::router(state))
         .with_graceful_shutdown(shutdown())

@@ -48,18 +48,29 @@ pub struct SyncReport {
 ///    лишние удаляются, при смене id таблица пересоздаётся.
 /// 2. Для каждой MergeTree-таблицы: target = leader.list_parts(id),
 ///    local = table.parts(). Скачать недостающие parts и одним вызовом
-///    table.sync_parts(скачанные, local - target).
+///    table.sync_parts_stream(ленивая загрузка, local - target).
 /// 3. Ошибка по одной таблице не останавливает остальные: она учитывается
 ///    в failures и логируется.
 ///
 /// Ошибки `ping` и `list_tables` фатальны: без снимка лидера локальные данные
 /// не меняются. Идентичность лидера проверяется до любых изменений.
-/// `Memory`-таблицы не реплицируются.
+/// Описания `Memory`-таблиц создаются, но строки не переносятся.
 pub fn sync_once(
     local: &dyn Catalog,
     leader: &dyn Peer,
     expected: &NodeIdentity,
 ) -> Result<SyncReport> {
+    sync_once_with_cancel(local, leader, expected, &|| false)
+}
+
+/// Отменяемый проход; проверяет остановку между операциями и загрузками частей.
+pub fn sync_once_with_cancel(
+    local: &dyn Catalog,
+    leader: &dyn Peer,
+    expected: &NodeIdentity,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<SyncReport> {
+    check_cancelled(cancelled)?;
     let actual = leader.ping()?;
     if &actual != expected {
         return Err(DbError::WrongLeader {
@@ -68,6 +79,7 @@ pub fn sync_once(
         });
     }
     let remote = leader.list_tables()?;
+    check_cancelled(cancelled)?;
     let local_before = local.table_entries();
     let mut report = SyncReport::default();
     // Таблицы, которые не удалось создать или подготовить: parts не трогаем.
@@ -75,16 +87,15 @@ pub fn sync_once(
 
     let remote_tables: BTreeMap<&str, &TableEntry> = remote
         .iter()
-        .filter(|entry| entry.definition.engine == Engine::MergeTree)
         .map(|entry| (entry.definition.name.as_str(), entry))
         .collect();
     let local_tables: BTreeMap<&str, &TableEntry> = local_before
         .iter()
-        .filter(|entry| entry.definition.engine == Engine::MergeTree)
         .map(|entry| (entry.definition.name.as_str(), entry))
         .collect();
 
     for (name, remote_entry) in &remote_tables {
+        check_cancelled(cancelled)?;
         let name = *name;
         let remote_entry = *remote_entry;
         match local_tables.get(name) {
@@ -131,6 +142,7 @@ pub fn sync_once(
     }
 
     for name in local_tables.keys() {
+        check_cancelled(cancelled)?;
         let name = *name;
         if remote_tables.contains_key(name) {
             continue;
@@ -145,17 +157,28 @@ pub fn sync_once(
     }
 
     for (name, remote_entry) in &remote_tables {
+        check_cancelled(cancelled)?;
         let name = *name;
-        if unavailable.contains(name) {
+        if unavailable.contains(name) || remote_entry.definition.engine == Engine::Memory {
             continue;
         }
-        if let Err(error) = sync_table(local, leader, remote_entry, &mut report) {
+        if let Err(error) = sync_table(local, leader, remote_entry, &mut report, cancelled) {
             report.failures += 1;
             tracing::warn!(table = %name, %error, "Не удалось синхронизировать parts");
         }
     }
 
+    check_cancelled(cancelled)?;
     Ok(report)
+}
+
+fn check_cancelled(cancelled: &dyn Fn() -> bool) -> Result<()> {
+    if cancelled() {
+        return Err(
+            std::io::Error::new(std::io::ErrorKind::Interrupted, "replication cancelled").into(),
+        );
+    }
+    Ok(())
 }
 
 /// Приводит набор активных parts одной таблицы к набору лидера.
@@ -164,6 +187,7 @@ fn sync_table(
     leader: &dyn Peer,
     entry: &TableEntry,
     report: &mut SyncReport,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<()> {
     let table = local.get_table_by_id(&entry.id)?;
     let target: BTreeSet<String> = leader.list_parts(&entry.id)?.into_iter().collect();
@@ -173,20 +197,33 @@ fn sync_table(
     if missing.is_empty() && remove.is_empty() {
         return Ok(());
     }
-    // Сначала скачиваем всё, затем публикуем набор одним вызовом:
-    // при ошибке скачивания локальные parts не меняются.
-    let mut fetched = Vec::with_capacity(missing.len());
-    for part in &missing {
-        let data = leader.fetch_part(&entry.id, part)?;
-        if &data.name != part {
-            return Err(DbError::Internal(format!(
-                "leader returned part {} instead of {part}",
-                data.name
-            )));
+    // Storage пишет одну часть на диск до запроса следующей. Публикация всего
+    // набора остаётся атомарной, а память не зависит от суммарного отставания.
+    let mut names = missing.iter();
+    let mut finished = false;
+    let mut fetched = std::iter::from_fn(|| {
+        if finished {
+            return None;
         }
-        fetched.push(data);
-    }
-    table.sync_parts(fetched, &remove)?;
+        if let Err(error) = check_cancelled(cancelled) {
+            finished = true;
+            return Some(Err(error));
+        }
+        let Some(part) = names.next() else {
+            finished = true;
+            return None;
+        };
+        Some(leader.fetch_part(&entry.id, part).and_then(|data| {
+            if &data.name != part {
+                return Err(DbError::Internal(format!(
+                    "leader returned part {} instead of {part}",
+                    data.name
+                )));
+            }
+            Ok(data)
+        }))
+    });
+    table.sync_parts_stream(&mut fetched, &remove)?;
     report.parts_fetched += missing.len();
     report.parts_removed += remove.len();
     Ok(())

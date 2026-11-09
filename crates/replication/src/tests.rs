@@ -502,7 +502,7 @@ fn unreachable_leader_leaves_replica_unchanged() {
 }
 
 #[test]
-fn memory_tables_are_not_replicated() {
+fn memory_definitions_are_replicated_without_fetching_parts() {
     let leader = TestCatalog::new();
     leader.install(FakeTable::new(
         definition("memo", Engine::Memory),
@@ -514,9 +514,12 @@ fn memory_tables_are_not_replicated() {
 
     let report = sync_once(&local, &leader, &leader_identity()).unwrap();
 
-    assert_eq!(report.tables_created, 0);
+    assert_eq!(report.tables_created, 1);
     assert_eq!(report.failures, 0);
-    assert!(local.get_table("memo").is_err());
+    assert_eq!(report.parts_fetched, 0);
+    let table = local.get_table("memo").unwrap();
+    assert_eq!(table.definition().engine, Engine::Memory);
+    assert!(table.parts().unwrap().is_empty());
 }
 
 #[test]
