@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="780" viewBox="0 0 1000 780" role="img" aria-labelledby="title description">
+  <title id="title">Запись большинством и смена лидера MiniClick</title>
+  <desc id="description">Запрос поступает лидеру A. После сохранения журнала на A и B и применения команды лидер отвечает клиенту. Узел C может догнать позже. После отказа A оставшиеся узлы выбирают лидера, а вернувшийся A восстанавливает журнал.</desc>
+  <rect width="1000" height="780" rx="16" fill="#ffffff"/>
+  <g font-family="DejaVu Sans, sans-serif" fill="#172b4d">
+    <text x="30" y="36" font-size="23" font-weight="bold">1. Запись: достаточно двух копий журнала из трёх</text>
+
+    <rect x="40" y="65" width="210" height="76" rx="10" fill="#f1f5f9" stroke="#64748b" stroke-width="2"/>
+    <rect x="290" y="65" width="210" height="76" rx="10" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+    <rect x="540" y="65" width="210" height="76" rx="10" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+    <rect x="790" y="65" width="170" height="76" rx="10" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+
+    <g text-anchor="middle">
+      <text x="145" y="97" font-size="18" font-weight="bold">Swagger / клиент</text>
+      <text x="145" y="122" font-size="14">HTTP-запросы</text>
+      <text x="395" y="97" font-size="19" font-weight="bold">A · Leader</text>
+      <text x="395" y="122" font-size="14">Свой журнал и таблицы</text>
+      <text x="645" y="97" font-size="19" font-weight="bold">B · Follower</text>
+      <text x="645" y="122" font-size="14">Свой журнал и таблицы</text>
+      <text x="875" y="97" font-size="19" font-weight="bold">C · Follower</text>
+      <text x="875" y="122" font-size="14">Своя копия данных</text>
+    </g>
+
+    <g stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="5 6">
+      <path d="M145 150 V430"/>
+      <path d="M395 150 V430"/>
+      <path d="M645 150 V430"/>
+      <path d="M875 150 V430"/>
+    </g>
+    <g fill="none" stroke="#172b4d" stroke-width="3">
+      <path d="M145 190 H393"/>
+      <path d="M395 245 H643"/>
+      <path d="M645 300 H397"/>
+      <path d="M395 355 H147"/>
+      <path d="M395 410 H873" stroke-dasharray="9 5"/>
+    </g>
+    <g fill="#172b4d">
+      <path d="M395 190 L381 182 L381 198 Z"/>
+      <path d="M645 245 L631 237 L631 253 Z"/>
+      <path d="M395 300 L409 292 L409 308 Z"/>
+      <path d="M145 355 L159 347 L159 363 Z"/>
+      <path d="M875 410 L861 402 L861 418 Z"/>
+    </g>
+    <g font-size="16" text-anchor="middle">
+      <text x="270" y="177">INSERT / изменяющий SQL</text>
+      <text x="520" y="232">Команда журнала</text>
+      <text x="520" y="287">Журнал сохранён на диске</text>
+      <text x="270" y="342">200 после применения</text>
+      <text x="635" y="397">C догоняет позже — один из возможных случаев</text>
+    </g>
+
+    <rect x="40" y="451" width="920" height="43" rx="8" fill="#eff6ff"/>
+    <text x="500" y="478" text-anchor="middle" font-size="16">Ответ 200: журнал устойчив на A + B, команда применена на A. У каждого узла свой volume.</text>
+
+    <path d="M30 520 H970" stroke="#cbd5e1" stroke-width="1.5"/>
+    <text x="30" y="558" font-size="23" font-weight="bold">2. Отказ: выборы и восстановление выполняет кластер</text>
+
+    <rect x="35" y="590" width="205" height="86" rx="10" fill="#fee2e2" stroke="#dc2626" stroke-width="2"/>
+    <rect x="275" y="590" width="205" height="86" rx="10" fill="#f1f5f9" stroke="#64748b" stroke-width="2"/>
+    <rect x="515" y="590" width="205" height="86" rx="10" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+    <rect x="755" y="590" width="210" height="86" rx="10" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+    <g fill="none" stroke="#172b4d" stroke-width="3">
+      <path d="M242 633 H271"/>
+      <path d="M482 633 H511"/>
+      <path d="M722 633 H751"/>
+    </g>
+    <g fill="#172b4d">
+      <path d="M273 633 L260 626 L260 640 Z"/>
+      <path d="M513 633 L500 626 L500 640 Z"/>
+      <path d="M753 633 L740 626 L740 640 Z"/>
+    </g>
+    <g text-anchor="middle" font-size="17">
+      <text x="137" y="623" font-weight="bold">A отключён</text>
+      <text x="137" y="650">Docker: kill</text>
+      <text x="377" y="623" font-weight="bold">B + C голосуют</text>
+      <text x="377" y="650">Большинство 2 из 3</text>
+      <text x="617" y="623" font-weight="bold">Новый лидер</text>
+      <text x="617" y="650">Запись продолжается</text>
+      <text x="860" y="623" font-weight="bold">A возвращается</text>
+      <text x="860" y="650">Догоняет журнал</text>
+    </g>
+    <text x="500" y="714" text-anchor="middle" font-size="16">Победитель не фиксирован. Повторный отказ — после синхронизации вернувшегося узла.</text>
+    <text x="500" y="748" text-anchor="middle" font-size="16" font-weight="bold">Один работающий узел не образует большинство и не подтверждает запись.</text>
+  </g>
+</svg>
