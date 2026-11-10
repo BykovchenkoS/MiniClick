@@ -72,3 +72,62 @@ fn replica_role_parses_identity_and_sync_interval() {
     );
     assert_eq!(config.node.sync_interval_ms, 250);
 }
+
+#[test]
+fn replica_accepts_dns_name_without_resolving_it_during_config_loading() {
+    let root = tempfile::tempdir().unwrap();
+    for address in ["leader:8123", "127.0.0.1:8123", "[::1]:8123"] {
+        let config = Config::load(
+            cli(&[
+                "--role",
+                "Replica",
+                "--leader-addr",
+                address,
+                "--leader-id",
+                "leader-1",
+            ]),
+            root.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            config.node.role,
+            replication::Role::Replica {
+                leader_addr: address.into(),
+                leader_id: "leader-1".into(),
+            }
+        );
+    }
+}
+
+#[test]
+fn replica_rejects_leader_addresses_without_explicit_valid_host_and_port() {
+    let root = tempfile::tempdir().unwrap();
+    for address in [
+        "leader",
+        "leader:",
+        ":8123",
+        "leader:65536",
+        "leader:abc",
+        "http://leader:8123",
+        "user@leader:8123",
+        "leader:8123/path",
+        "leader:8123?x=1",
+        "leader:8123#fragment",
+    ] {
+        assert!(
+            Config::load(
+                cli(&[
+                    "--role",
+                    "Replica",
+                    "--leader-addr",
+                    address,
+                    "--leader-id",
+                    "leader-1"
+                ]),
+                root.path(),
+            )
+            .is_err(),
+            "{address}"
+        );
+    }
+}

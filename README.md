@@ -6,6 +6,12 @@
 
 ## Сборка и запуск
 
+Для двух узлов Leader–Replica в Docker: `docker compose up -d --build --wait`.
+Swagger лидера доступен на порту 8123, реплики — 8124.
+Сценарий показа: `bash scripts/demo-replication.sh`.
+Назначение ролей, гарантии асинхронной репликации и команды описаны
+в [инструкции Docker](docs/docker-replication.md).
+
 Целевая среда — Linux (в том числе WSL), Rust 1.90.0 с rustfmt и clippy.
 Storage использует файловые блокировки Rust 1.89+ и синхронизацию каталогов;
 Windows не является средой приёмки. Для замеров в WSL держите проект и данные

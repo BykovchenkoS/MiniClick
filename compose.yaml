@@ -1,0 +1,37 @@
+name: miniclick
+
+x-node: &node
+  image: miniclick:local
+  build: .
+  environment:
+    RUST_LOG: info
+  stop_grace_period: 330s
+  healthcheck:
+    test: ["CMD", "curl", "--fail", "--silent", "--max-time", "2", "http://127.0.0.1:8123/ping"]
+    interval: 2s
+    timeout: 3s
+    retries: 15
+    start_period: 5s
+
+services:
+  leader:
+    <<: *node
+    command: ["--config", "/app/node.toml"]
+    ports:
+      - "127.0.0.1:${MINICLICK_LEADER_PORT:-8123}:8123"
+    volumes:
+      - ./deploy/leader.toml:/app/node.toml:ro
+      - leader-data:/data
+
+  replica:
+    <<: *node
+    command: ["--config", "/app/node.toml"]
+    ports:
+      - "127.0.0.1:${MINICLICK_REPLICA_PORT:-8124}:8123"
+    volumes:
+      - ./deploy/replica.toml:/app/node.toml:ro
+      - replica-data:/data
+
+volumes:
+  leader-data:
+  replica-data:

@@ -29,7 +29,7 @@ pub struct Cli {
     pub cluster_id: Option<String>,
     #[arg(long, help = "Роль узла: Leader или Replica")]
     pub role: Option<String>,
-    #[arg(long, help = "Адрес лидера для Replica, например 127.0.0.1:8123")]
+    #[arg(long, help = "Адрес лидера для Replica: IP:порт или имя:порт")]
     pub leader_addr: Option<String>,
     #[arg(long, help = "Ожидаемый node_id лидера для Replica")]
     pub leader_id: Option<String>,
@@ -141,9 +141,18 @@ impl Config {
             leader_id,
         } = &self.node.role
         {
-            leader_addr.parse::<SocketAddr>().map_err(|_| {
-                DbError::Syntax("leader_addr must be an IP address and port".into())
-            })?;
+            // Имя разрешается HTTP-клиентом при соединении: узел может появиться позже.
+            let authority = leader_addr
+                .parse::<axum::http::uri::Authority>()
+                .map_err(|_| DbError::Syntax("leader_addr must be a host and port".into()))?;
+            if authority.host().is_empty()
+                || authority.port_u16().is_none()
+                || leader_addr.contains('@')
+            {
+                return Err(DbError::Syntax(
+                    "leader_addr must be a host and port".into(),
+                ));
+            }
             if leader_id.trim().is_empty() {
                 return Err(DbError::Syntax("leader_id must not be empty".into()));
             }

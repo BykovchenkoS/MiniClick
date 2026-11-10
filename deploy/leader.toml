@@ -1,0 +1,5 @@
+listen_addr = "0.0.0.0:8123"
+data_dir = "/data"
+cluster_id = "miniclick-demo"
+node_id = "leader-1"
+role = "Leader"
