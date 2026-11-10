@@ -131,3 +131,25 @@ fn replica_rejects_leader_addresses_without_explicit_valid_host_and_port() {
         );
     }
 }
+
+#[test]
+fn cluster_config_accepts_three_members_without_resolving_dns() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("config.toml"), "[cluster]\nid = 2\nmembers = { '1' = 'node1:8123', '2' = 'node2:8123', '3' = 'node3:8123' }\n").unwrap();
+    Config::load(cli(&[]), root.path()).unwrap();
+}
+
+#[test]
+fn cluster_config_rejects_ambiguous_members_and_static_replica_role() {
+    let root = tempfile::tempdir().unwrap();
+    for configuration in [
+        "[cluster]\nid = 4\nmembers = { '1' = 'node1:8123', '2' = 'node2:8123', '3' = 'node3:8123' }",
+        "[cluster]\nid = 1\nmembers = { '1' = 'node1:8123', '2' = 'node2:8123' }",
+        "[cluster]\nid = 1\nmembers = { '1' = 'node1:8123', '2' = 'node1:8123', '3' = 'node3:8123' }",
+        "[cluster]\nid = 1\nmembers = { '1' = 'node1', '2' = 'node2:8123', '3' = 'node3:8123' }",
+        "role = 'Replica'\nleader_addr = 'node1:8123'\nleader_id = 'node1'\n[cluster]\nid = 2\nmembers = { '1' = 'node1:8123', '2' = 'node2:8123', '3' = 'node3:8123' }",
+    ] {
+        std::fs::write(root.path().join("config.toml"), configuration).unwrap();
+        assert!(Config::load(cli(&[]), root.path()).is_err(), "{configuration}");
+    }
+}

@@ -3,6 +3,8 @@
 use clap::Parser;
 use replication::{NodeConfig, Role};
 use serde::Deserialize;
+use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use types::{DbError, Result};
@@ -51,6 +53,32 @@ struct FileConfig {
     leader_id: Option<String>,
     sync_interval_ms: Option<u64>,
     max_body_bytes: Option<usize>,
+    cluster: Option<ClusterConfig>,
+}
+
+/// Фиксированный состав Raft; DNS разрешается только при сетевом соединении.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterConfig {
+    pub id: u64,
+    #[serde(deserialize_with = "deserialize_members")]
+    pub members: BTreeMap<u64, String>,
+}
+
+fn deserialize_members<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<u64, String>, D::Error> {
+    let members = BTreeMap::<String, String>::deserialize(deserializer)?;
+    members
+        .into_iter()
+        .map(|(key, address)| {
+            let id = key.parse::<u64>().map_err(serde::de::Error::custom)?;
+            if id.to_string() != key {
+                return Err(serde::de::Error::custom("member id must be canonical"));
+            }
+            Ok((id, address))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +86,7 @@ pub struct Config {
     pub node: NodeConfig,
     pub data_dir: PathBuf,
     pub max_body_bytes: usize,
+    pub cluster: Option<ClusterConfig>,
 }
 
 impl Default for Config {
@@ -72,6 +101,7 @@ impl Default for Config {
             },
             data_dir: PathBuf::from("./data"),
             max_body_bytes: 256 * 1024 * 1024,
+            cluster: None,
         }
     }
 }
@@ -88,7 +118,10 @@ impl Config {
         } else {
             FileConfig::default()
         };
-        let mut config = Self::default();
+        let mut config = Self {
+            cluster: file.cluster,
+            ..Self::default()
+        };
         if let Some(addr) = cli.listen_addr.or(file.listen_addr) {
             config.node.listen_addr = addr;
         }
@@ -121,6 +154,19 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if let Some(cluster) = &self.cluster {
+            if cluster.members.len() != 3
+                || !cluster.members.contains_key(&cluster.id)
+                || cluster.members.contains_key(&0)
+                || cluster.members.values().collect::<BTreeSet<_>>().len() != 3
+                || matches!(self.node.role, Role::Replica { .. })
+            {
+                return Err(DbError::Syntax("cluster requires three distinct members, a local id and no static Replica role".into()));
+            }
+            for address in cluster.members.values() {
+                validate_peer_address(address)?;
+            }
+        }
         self.node
             .listen_addr
             .parse::<SocketAddr>()
@@ -142,23 +188,25 @@ impl Config {
         } = &self.node.role
         {
             // Имя разрешается HTTP-клиентом при соединении: узел может появиться позже.
-            let authority = leader_addr
-                .parse::<axum::http::uri::Authority>()
-                .map_err(|_| DbError::Syntax("leader_addr must be a host and port".into()))?;
-            if authority.host().is_empty()
-                || authority.port_u16().is_none()
-                || leader_addr.contains('@')
-            {
-                return Err(DbError::Syntax(
-                    "leader_addr must be a host and port".into(),
-                ));
-            }
+            validate_peer_address(leader_addr)?;
             if leader_id.trim().is_empty() {
                 return Err(DbError::Syntax("leader_id must not be empty".into()));
             }
         }
         Ok(())
     }
+}
+
+fn validate_peer_address(address: &str) -> Result<()> {
+    let authority = address
+        .parse::<axum::http::uri::Authority>()
+        .map_err(|_| DbError::Syntax("peer address must be a host and port".into()))?;
+    if authority.host().is_empty() || authority.port_u16().is_none() || address.contains('@') {
+        return Err(DbError::Syntax(
+            "peer address must be a host and port".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_role(role: &str, leader_addr: Option<String>, leader_id: Option<String>) -> Result<Role> {

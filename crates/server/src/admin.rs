@@ -1,8 +1,11 @@
 //! Проверка доступности и примеры HTTP-запросов.
 
 #[utoipa::path(get, path = "/ping", tag = "admin", responses((status = 200, description = "Сервер доступен", body = String, content_type = "text/plain")))]
-pub async fn ping() -> &'static str {
-    "Ok.\n"
+pub async fn ping(
+    axum::extract::State(app): axum::extract::State<crate::AppState>,
+) -> Result<&'static str, crate::error::ApiError> {
+    app.check_view()?;
+    Ok("Ok.\n")
 }
 
 #[utoipa::path(get, path = "/help", tag = "admin", responses((status = 200, description = "Примеры операций", body = String, content_type = "text/plain")))]

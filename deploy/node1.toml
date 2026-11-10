@@ -1,0 +1,8 @@
+listen_addr = "0.0.0.0:8123"
+data_dir = "/data"
+cluster_id = "miniclick-raft-demo"
+node_id = "node1"
+
+[cluster]
+id = 1
+members = { "1" = "node1:8123", "2" = "node2:8123", "3" = "node3:8123" }

@@ -7,7 +7,7 @@ use crate::{
 use axum::extract::{rejection::PathRejection, Path, State};
 use axum::Json;
 use serde::Serialize;
-use types::{Codec, Engine, ScanRequest, ScanStats, TableDefinition};
+use types::{Codec, DbError, Engine, ScanRequest, ScanStats, TableDefinition};
 use utoipa::ToSchema;
 
 #[derive(Serialize, ToSchema)]
@@ -100,6 +100,11 @@ pub struct TableDescription {
 ))]
 pub async fn tables(State(app): State<AppState>) -> Result<Json<Vec<TableInfo>>, ApiError> {
     blocking(move || {
+        let _view = app
+            .view_gate
+            .read()
+            .map_err(|_| DbError::Internal("view lock poisoned".into()))?;
+        app.check_view()?;
         Ok(Json(
             app.catalog
                 .list_tables()
@@ -123,6 +128,11 @@ pub async fn describe(
 ) -> Result<Json<TableDescription>, ApiError> {
     let Path(name) = path?;
     blocking(move || {
+        let _view = app
+            .view_gate
+            .read()
+            .map_err(|_| DbError::Internal("view lock poisoned".into()))?;
+        app.check_view()?;
         let table = app.catalog.get_table(&name)?;
         Ok(Json(TableDescription {
             definition: table.definition().clone().into(),

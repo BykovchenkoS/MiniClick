@@ -52,7 +52,31 @@ pub async fn query(
 ) -> Result<Response, ApiError> {
     let Query(params) = params?;
     let body = body?;
+    if let Some(cluster) = &app.cluster {
+        let candidate = body.clone();
+        let command = blocking(move || {
+            let sql = std::str::from_utf8(&candidate)
+                .map_err(|_| DbError::Syntax("SQL body must be UTF-8".into()))?;
+            Ok(::query::is_write(sql)?.then(|| sql.to_owned()))
+        })
+        .await?;
+        if let Some(sql) = command {
+            cluster
+                .write(crate::cluster::types::Command::Sql(sql))
+                .await?;
+            return Ok((
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                "Ok.\n",
+            )
+                .into_response());
+        }
+    }
     let (content_type, output) = blocking(move || {
+        let _view = app
+            .view_gate
+            .read()
+            .map_err(|_| DbError::Internal("view lock poisoned".into()))?;
+        app.check_view()?;
         let sql = std::str::from_utf8(&body)
             .map_err(|_| DbError::Syntax("SQL body must be UTF-8".into()))?;
         if app.is_replica() && ::query::is_write(sql)? {

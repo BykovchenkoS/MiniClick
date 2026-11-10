@@ -53,6 +53,16 @@ pub async fn insert(
 ) -> Result<&'static str, ApiError> {
     let Path(name) = path?;
     let Query(params) = params?;
+    if let Some(cluster) = &app.cluster {
+        cluster
+            .write(crate::cluster::types::Command::Insert {
+                table: name,
+                format: params.format,
+                body: body?.to_vec(),
+            })
+            .await?;
+        return Ok("Ok.\n");
+    }
     app.check_writable()?;
     let body = body?;
     blocking(move || {

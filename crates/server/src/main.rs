@@ -18,8 +18,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
     let config = Config::load(Cli::parse(), &std::env::current_dir()?)?;
     let address = config.node.listen_addr.clone();
-    let state = tokio::task::spawn_blocking(move || AppState::open(config)).await??;
+    let mut state = tokio::task::spawn_blocking(move || AppState::open(config)).await??;
     let listener = tokio::net::TcpListener::bind(&address).await?;
+    if state.config.cluster.is_some() {
+        state.cluster = Some(server::cluster::Cluster::start(&state).await?);
+    }
+    let cluster = state.cluster.clone();
     let mut sync_task = None;
     if let replication::Role::Replica {
         leader_addr,
@@ -53,6 +57,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(()) => tracing::info!("Фоновая синхронизация остановлена"),
             Err(error) => tracing::error!(%error, "Фоновая синхронизация завершилась с ошибкой"),
         }
+    }
+    if let Some(cluster) = cluster {
+        cluster.raft.shutdown().await?;
     }
     served?;
     Ok(())

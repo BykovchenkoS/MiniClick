@@ -4,8 +4,8 @@ x-node: &node
   image: miniclick:local
   build: .
   environment:
-    RUST_LOG: info
-  stop_grace_period: 330s
+    RUST_LOG: info,openraft=warn
+  stop_grace_period: 15s
   healthcheck:
     test: ["CMD", "curl", "--fail", "--silent", "--max-time", "2", "http://127.0.0.1:8123/ping"]
     interval: 2s
@@ -14,24 +14,34 @@ x-node: &node
     start_period: 5s
 
 services:
-  leader:
+  node1:
     <<: *node
     command: ["--config", "/app/node.toml"]
     ports:
-      - "127.0.0.1:${MINICLICK_LEADER_PORT:-8123}:8123"
+      - "127.0.0.1:${MINICLICK_NODE1_PORT:-8123}:8123"
     volumes:
-      - ./deploy/leader.toml:/app/node.toml:ro
-      - leader-data:/data
+      - ./deploy/node1.toml:/app/node.toml:ro
+      - node1-data:/data
 
-  replica:
+  node2:
     <<: *node
     command: ["--config", "/app/node.toml"]
     ports:
-      - "127.0.0.1:${MINICLICK_REPLICA_PORT:-8124}:8123"
+      - "127.0.0.1:${MINICLICK_NODE2_PORT:-8124}:8123"
     volumes:
-      - ./deploy/replica.toml:/app/node.toml:ro
-      - replica-data:/data
+      - ./deploy/node2.toml:/app/node.toml:ro
+      - node2-data:/data
+
+  node3:
+    <<: *node
+    command: ["--config", "/app/node.toml"]
+    ports:
+      - "127.0.0.1:${MINICLICK_NODE3_PORT:-8125}:8123"
+    volumes:
+      - ./deploy/node3.toml:/app/node.toml:ro
+      - node3-data:/data
 
 volumes:
-  leader-data:
-  replica-data:
+  node1-data:
+  node2-data:
+  node3-data:

@@ -1,8 +1,0 @@
-listen_addr = "0.0.0.0:8123"
-data_dir = "/data"
-cluster_id = "miniclick-demo"
-node_id = "replica-1"
-role = "Replica"
-leader_addr = "leader:8123"
-leader_id = "leader-1"
-sync_interval_ms = 1000
