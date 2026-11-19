@@ -3,7 +3,7 @@
 pub(crate) mod read;
 
 use crate::{
-    config::ShardedTableConfig,
+    config::{RaftShardConfig, ShardedTableConfig},
     error::{blocking, ApiError},
     formats::{parse_input, InputFormat},
     insert::{insert_block, InsertParams},
@@ -16,8 +16,10 @@ use axum::{
         Path, Query, State,
     },
     http::StatusCode,
+    Json,
 };
 use reqwest::{Client, Url};
+use serde::Deserialize;
 use std::{collections::BTreeMap, time::Duration};
 use types::{ColumnData, DataType, DbError, Engine, TableEntry, TableId};
 
@@ -39,10 +41,16 @@ pub(crate) async fn insert(
 ) -> Result<(), ApiError> {
     let mut entries = BTreeMap::new();
     for (&id, address) in &table.shards {
-        let base = shard_url(address).map_err(|error| shard_error(id, error))?;
+        let group = table.raft_shards.get(&id);
+        let base = match group {
+            Some(group) => leader(client, group)
+                .await
+                .map_err(|error| shard_error(id, error))?,
+            None => shard_url(address).map_err(|error| shard_error(id, error))?,
+        };
         let metadata = client
             .get(
-                base.join("replica/tables")
+                base.join(metadata_path(group.is_some()))
                     .map_err(|error| shard_error(id, error))?,
             )
             .send()
@@ -126,6 +134,64 @@ pub(crate) async fn insert(
     }
 }
 
+fn metadata_path(replicated: bool) -> &'static str {
+    if replicated {
+        "shard/tables"
+    } else {
+        "replica/tables"
+    }
+}
+
+#[derive(Deserialize)]
+struct MemberStatus {
+    id: u64,
+    cluster_id: String,
+    role: String,
+    leader: Option<u64>,
+    healthy: bool,
+}
+
+impl MemberStatus {
+    fn is_leader_of(&self, group: &RaftShardConfig) -> bool {
+        self.healthy
+            && self.cluster_id == group.cluster_id
+            && self.role == "Leader"
+            && self.leader == Some(self.id)
+    }
+}
+
+async fn leader(client: &Client, group: &RaftShardConfig) -> types::Result<Url> {
+    for address in &group.members {
+        let base = shard_url(address)?;
+        let status = base
+            .join("cluster/status")
+            .map_err(|error| DbError::Internal(error.to_string()))?;
+        if let Ok(response) = client
+            .get(status)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+        {
+            if response.status() == StatusCode::OK
+                && response
+                    .json::<MemberStatus>()
+                    .await
+                    .is_ok_and(|status| status.is_leader_of(group))
+            {
+                return Ok(base);
+            }
+        }
+    }
+    Err(no_leader(group))
+}
+
+fn no_leader(group: &RaftShardConfig) -> DbError {
+    DbError::Io(std::io::Error::other(format!(
+        "no healthy leader for Raft group {}",
+        group.cluster_id
+    )))
+}
+
 fn shard_url(address: &str) -> types::Result<Url> {
     Url::parse(&format!("http://{address}/"))
         .map_err(|error| DbError::Syntax(format!("invalid shard URL: {error}")))
@@ -178,6 +244,16 @@ pub(crate) async fn insert_local(
     let Path(id) = path?;
     let Query(params) = params?;
     let body = body?;
+    if let Some(cluster) = &app.cluster {
+        cluster
+            .write(crate::cluster::types::Command::ShardInsert {
+                table: TableId::new(id),
+                format: params.format,
+                body: body.to_vec(),
+            })
+            .await?;
+        return Ok("Ok.\n");
+    }
     blocking(move || {
         // ID связывает запись со схемой, прочитанной координатором до разбора тела.
         let table = app.catalog.get_table_by_id(&TableId::new(id))?;
@@ -190,4 +266,30 @@ pub(crate) async fn insert_local(
     })
     .await?;
     Ok("Ok.\n")
+}
+
+pub(crate) async fn tables(State(app): State<AppState>) -> Result<Json<Vec<TableEntry>>, ApiError> {
+    read_barrier(&app).await?;
+    blocking(move || {
+        let _view = app
+            .view_gate
+            .read()
+            .map_err(|_| DbError::Internal("view lock poisoned".into()))?;
+        app.check_view()?;
+        Ok(Json(
+            app.catalog
+                .table_entries()
+                .into_iter()
+                .filter(|entry| app.config.local_shards.contains_key(&entry.definition.name))
+                .collect(),
+        ))
+    })
+    .await
+}
+
+async fn read_barrier(app: &AppState) -> Result<(), ApiError> {
+    if let Some(cluster) = &app.cluster {
+        cluster.read_barrier().await?;
+    }
+    Ok(())
 }

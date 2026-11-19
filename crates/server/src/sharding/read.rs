@@ -2,9 +2,11 @@
 
 mod wire;
 
-use super::{physical_entry, shard_url, table_url};
+use super::{
+    metadata_path, no_leader, physical_entry, read_barrier, shard_url, table_url, MemberStatus,
+};
 use crate::{
-    config::ShardedTableConfig,
+    config::{RaftShardConfig, ShardedTableConfig},
     error::{blocking, ApiError},
     meta::ScanInfo,
     AppState,
@@ -89,10 +91,14 @@ struct Shard {
 }
 
 impl Shard {
-    fn entry(&self, client: &Client, config: &ShardedTableConfig) -> Result<TableEntry> {
+    fn entry(&mut self, client: &Client, config: &ShardedTableConfig) -> Result<TableEntry> {
+        let group = config.raft_shards.get(&self.id);
+        if let Some(group) = group {
+            self.base = leader(client, group).map_err(|error| shard_error(self.id, error))?;
+        }
         let metadata = self
             .base
-            .join("replica/tables")
+            .join(metadata_path(group.is_some()))
             .map_err(|error| shard_error(self.id, error))?;
         let tables = client
             .get(metadata)
@@ -117,6 +123,26 @@ impl Shard {
         }
         Ok(self)
     }
+}
+
+fn leader(client: &Client, group: &RaftShardConfig) -> Result<Url> {
+    for address in &group.members {
+        let base = shard_url(address)?;
+        let status = base
+            .join("cluster/status")
+            .map_err(|error| DbError::Internal(error.to_string()))?;
+        let response = client.get(status).timeout(Duration::from_secs(1)).send();
+        if let Ok(response) = response {
+            if response.status().is_success()
+                && response
+                    .json::<MemberStatus>()
+                    .is_ok_and(|status| status.is_leader_of(group))
+            {
+                return Ok(base);
+            }
+        }
+    }
+    Err(no_leader(group))
 }
 
 impl ShardedTable {
@@ -333,6 +359,16 @@ fn physical_table(app: &AppState, id: String) -> Result<Arc<dyn Table>> {
             "shard table must use MergeTree".into(),
         ));
     }
+    if app.cluster.is_some()
+        && !app
+            .config
+            .local_shards
+            .contains_key(&table.definition().name)
+    {
+        return Err(DbError::Unsupported(
+            "Raft table has no shard placement".into(),
+        ));
+    }
     Ok(table)
 }
 
@@ -343,7 +379,16 @@ pub(crate) async fn scan_local(
 ) -> std::result::Result<Response, ApiError> {
     let Json(request) =
         request.map_err(|error| ApiError::new(error.status(), error.body_text()))?;
-    let scan = blocking(move || physical_table(&app, id)?.scan(&request.into())).await?;
+    read_barrier(&app).await?;
+    let scan = blocking(move || {
+        let _view = app
+            .view_gate
+            .read()
+            .map_err(|_| DbError::Internal("view lock poisoned".into()))?;
+        app.check_view()?;
+        physical_table(&app, id)?.scan(&request.into())
+    })
+    .await?;
     let (sender, receiver) = tokio::sync::mpsc::channel(1);
     tokio::task::spawn_blocking(move || {
         for block in scan {
@@ -376,6 +421,15 @@ pub(crate) async fn stats_local(
 ) -> std::result::Result<Json<ScanInfo>, ApiError> {
     let Json(request) =
         request.map_err(|error| ApiError::new(error.status(), error.body_text()))?;
-    let stats = blocking(move || physical_table(&app, id)?.explain_scan(&request.into())).await?;
+    read_barrier(&app).await?;
+    let stats = blocking(move || {
+        let _view = app
+            .view_gate
+            .read()
+            .map_err(|_| DbError::Internal("view lock poisoned".into()))?;
+        app.check_view()?;
+        physical_table(&app, id)?.explain_scan(&request.into())
+    })
+    .await?;
     Ok(Json(stats.into()))
 }

@@ -1,0 +1,62 @@
+name: miniclick-sharding-raft
+
+x-node: &node
+  image: miniclick:sharding-raft-demo
+  build: .
+  command: ["--config", "/app/node.toml"]
+  environment:
+    RUST_LOG: info,openraft=warn
+  stop_grace_period: 15s
+  healthcheck:
+    test: ["CMD", "curl", "--fail", "--silent", "--max-time", "2", "http://127.0.0.1:8123/ping"]
+    interval: 2s
+    timeout: 3s
+    retries: 15
+
+services:
+  coordinator:
+    <<: *node
+    ports:
+      - "127.0.0.1:8140:8123"
+    volumes:
+      - ./deploy/sharding-raft-coordinator.toml:/app/node.toml:ro
+      - coordinator-data:/data
+
+  shard-even-1:
+    <<: *node
+    ports:
+      - "127.0.0.1:8141:8123"
+    volumes:
+      - ./deploy/sharding-raft-even-1.toml:/app/node.toml:ro
+      - shard-even-1-data:/data
+
+  shard-even-2:
+    <<: *node
+    ports:
+      - "127.0.0.1:8142:8123"
+    volumes:
+      - ./deploy/sharding-raft-even-2.toml:/app/node.toml:ro
+      - shard-even-2-data:/data
+
+  shard-even-3:
+    <<: *node
+    ports:
+      - "127.0.0.1:8143:8123"
+    volumes:
+      - ./deploy/sharding-raft-even-3.toml:/app/node.toml:ro
+      - shard-even-3-data:/data
+
+  shard-odd:
+    <<: *node
+    ports:
+      - "127.0.0.1:8144:8123"
+    volumes:
+      - ./deploy/sharding-odd.toml:/app/node.toml:ro
+      - shard-odd-data:/data
+
+volumes:
+  coordinator-data:
+  shard-even-1-data:
+  shard-even-2-data:
+  shard-even-3-data:
+  shard-odd-data:

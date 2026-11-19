@@ -153,13 +153,19 @@ pub fn router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(limit));
     // Источником для других реплик служит только лидер.
     if state.config.cluster.is_none() && !state.is_replica() {
-        // Типизированное условие в JSON длиннее исходного SQL.
-        let read_limit = limit.max(64 * 1024);
         router = router
             .route("/replica/ping", get(replica::ping))
             .route("/replica/tables", get(replica::tables))
             .route("/replica/tables/{id}/parts", get(replica::parts))
-            .route("/replica/tables/{id}/parts/{part}", get(replica::part))
+            .route("/replica/tables/{id}/parts/{part}", get(replica::part));
+    }
+    if state.config.cluster.is_none() && !state.is_replica()
+        || state.config.cluster.is_some() && !state.config.local_shards.is_empty()
+    {
+        // Типизированное условие в JSON длиннее исходного SQL.
+        let read_limit = limit.max(64 * 1024);
+        router = router
+            .route("/shard/tables", get(sharding::tables))
             .route(
                 "/shard/insert/{id}",
                 post(sharding::insert_local).layer(DefaultBodyLimit::max(limit)),

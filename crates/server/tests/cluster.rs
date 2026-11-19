@@ -26,6 +26,10 @@ impl Cluster {
     }
 
     async fn start_with_limit(limit: usize) -> Self {
+        Self::start_with_config(limit, "").await
+    }
+
+    async fn start_with_config(limit: usize, placement: &str) -> Self {
         let listeners: Vec<_> = (0..3)
             .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
             .collect();
@@ -44,7 +48,7 @@ impl Cluster {
         };
         drop(listeners);
         for node in 0..3 {
-            let config = format!("max_body_bytes = {limit}\nlisten_addr = '{}'\ndata_dir = '{}'\ncluster_id = 'process-test'\nnode_id = 'node{}'\n[cluster]\nid = {}\nmembers = {{ '1' = '{}', '2' = '{}', '3' = '{}' }}\n", cluster.addresses[node], cluster.root.path().join(format!("data{node}")).display(), node+1, node+1, cluster.addresses[0], cluster.addresses[1], cluster.addresses[2]);
+            let config = format!("max_body_bytes = {limit}\nlisten_addr = '{}'\ndata_dir = '{}'\ncluster_id = 'process-test'\nnode_id = 'node{}'\n[cluster]\nid = {}\nmembers = {{ '1' = '{}', '2' = '{}', '3' = '{}' }}\n{placement}", cluster.addresses[node], cluster.root.path().join(format!("data{node}")).display(), node+1, node+1, cluster.addresses[0], cluster.addresses[1], cluster.addresses[2]);
             std::fs::write(cluster.config(node), config).unwrap();
             cluster.restart(node).await;
         }
@@ -197,6 +201,82 @@ impl Cluster {
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
     }
+}
+
+#[tokio::test]
+async fn coordinator_reads_committed_shard_rows_and_inserts_after_raft_leader_failure() {
+    let mut cluster = Cluster::start_with_config(
+        256 * 1024 * 1024,
+        "\n[local_shards.hits]\nkey = 'id'\nshard_id = 1\nshard_ids = [1, 2]\n",
+    )
+    .await;
+    let response = cluster
+        .client
+        .post(cluster.url(0, "/cluster/init"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let first = cluster.leader().await;
+    let listeners: Vec<_> = (0..2)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    cluster.addresses.extend(
+        listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap().to_string()),
+    );
+    cluster.processes.extend([None, None]);
+    let (odd, coordinator) = (3, 4);
+    let odd_config = format!(
+        "listen_addr = '{}'\ndata_dir = '{}'\n[local_shards.hits]\nkey = 'id'\nshard_id = 2\nshard_ids = [1, 2]\n",
+        cluster.addresses[odd], cluster.root.path().join("odd").display()
+    );
+    let coordinator_config = format!(
+        "listen_addr = '{}'\ndata_dir = '{}'\n[sharding.hits]\nlocal_table = 'hits'\nkey = 'id'\nshards = {{ '1' = '{}', '2' = '{}' }}\n[sharding.hits.raft_shards.'1']\ncluster_id = 'process-test'\nmembers = {:?}\n",
+        cluster.addresses[coordinator], cluster.root.path().join("coordinator").display(),
+        cluster.addresses[first], cluster.addresses[odd], &cluster.addresses[..3]
+    );
+    std::fs::write(cluster.config(odd), odd_config).unwrap();
+    std::fs::write(cluster.config(coordinator), coordinator_config).unwrap();
+    drop(listeners);
+    cluster.restart(odd).await;
+    cluster.restart(coordinator).await;
+    let ddl = "CREATE TABLE hits (id UInt64, value String) ENGINE = MergeTree ORDER BY id";
+    cluster.sql(first, ddl).await;
+    cluster.sql(odd, ddl).await;
+    assert_eq!(
+        cluster.insert(coordinator, "2,before\n").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        cluster.insert(coordinator, "1,ordinary\n").await,
+        StatusCode::OK
+    );
+
+    cluster.kill(first);
+    let second = cluster.leader().await;
+    assert_ne!(first, second);
+    let query = "SELECT id, value FROM hits ORDER BY id";
+    assert_eq!(
+        cluster.sql(coordinator, query).await,
+        "1\tordinary\n2\tbefore\n"
+    );
+    assert_eq!(
+        cluster.insert(coordinator, "4,after\n").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        cluster.insert(second, "6,allowed\n7,wrong-shard\n").await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        cluster.sql(coordinator, query).await,
+        "1\tordinary\n2\tbefore\n4\tafter\n"
+    );
+
+    cluster.restart(first).await;
+    cluster.await_rows(first, "2\tbefore\n4\tafter\n").await;
 }
 
 #[tokio::test]

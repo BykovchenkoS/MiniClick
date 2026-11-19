@@ -20,6 +20,7 @@ use openraft::raft::{
 };
 use openraft::{BasicNode, ServerState};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf;
@@ -29,12 +30,31 @@ use std::time::Duration;
 pub struct Cluster {
     pub raft: ClusterRaft,
     config: crate::config::ClusterConfig,
+    placement: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize, PartialEq, Eq)]
 struct Identity {
     cluster_id: String,
     config: Option<crate::config::ClusterConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    placement: Option<String>,
+}
+
+fn placement(config: &Config) -> Result<Option<String>> {
+    if config.local_shards.is_empty() {
+        return Ok(None);
+    }
+    let mut rules = config.local_shards.clone();
+    for rule in rules.values_mut() {
+        rule.shard_ids.sort_unstable();
+    }
+    let bytes = serde_json::to_vec(&rules).map_err(|error| DbError::Internal(error.to_string()))?;
+    let fingerprint = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok(Some(fingerprint))
 }
 
 /// view целиком производен от истории; чужой каталог и символьные ссылки не удаляем.
@@ -52,6 +72,7 @@ pub(crate) fn prepare_view(config: &Config) -> Result<(PathBuf, Arc<File>)> {
     let identity = Identity {
         cluster_id: config.node.cluster_id.clone(),
         config: config.cluster.clone(),
+        placement: placement(config)?,
     };
     let identity_path = config.data_dir.join("cluster-identity.json");
     let view = config.data_dir.join("view");
@@ -113,14 +134,20 @@ impl Cluster {
         }
         .validate()
         .map_err(|error| DbError::Syntax(error.to_string()))?;
+        let placement = placement(&app.config)?;
         let network = network::Network {
             client: reqwest::Client::new(),
             cluster_id: app.config.node.cluster_id.clone(),
+            placement: placement.clone(),
         };
         let raft = ClusterRaft::new(config.id, Arc::new(settings), network, log, state_machine)
             .await
             .map_err(|error| DbError::Internal(error.to_string()))?;
-        Ok(Arc::new(Self { raft, config }))
+        Ok(Arc::new(Self {
+            raft,
+            config,
+            placement,
+        }))
     }
 
     pub fn is_leader(&self) -> bool {
@@ -167,6 +194,19 @@ impl Cluster {
         }
         Ok(())
     }
+
+    pub(crate) async fn read_barrier(&self) -> std::result::Result<(), ApiError> {
+        if !self.is_leader() {
+            return Err(self.not_leader());
+        }
+        tokio::time::timeout(Duration::from_secs(3), self.raft.ensure_linearizable())
+            .await
+            .map_err(|_| {
+                ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "shard read quorum timeout")
+            })?
+            .map_err(|error| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+        Ok(())
+    }
 }
 
 fn cluster(app: &AppState) -> std::result::Result<&Arc<Cluster>, ApiError> {
@@ -176,11 +216,15 @@ fn cluster(app: &AppState) -> std::result::Result<&Arc<Cluster>, ApiError> {
 }
 
 fn check_cluster(app: &AppState, headers: &HeaderMap) -> std::result::Result<(), ApiError> {
-    cluster(app)?;
+    let cluster = cluster(app)?;
     if headers
         .get("x-miniclick-cluster")
         .and_then(|value| value.to_str().ok())
         != Some(app.config.node.cluster_id.as_str())
+        || headers
+            .get("x-miniclick-placement")
+            .and_then(|value| value.to_str().ok())
+            != cluster.placement.as_deref()
     {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -198,6 +242,7 @@ pub async fn status(
     let metrics = cluster.raft.metrics().borrow().clone();
     Ok(Json(serde_json::json!({
         "id": metrics.id,
+        "cluster_id": app.config.node.cluster_id,
         "role": format!("{:?}", metrics.state),
         "leader": metrics.current_leader,
         "leader_addr": metrics.current_leader.and_then(|id| cluster.config.members.get(&id)),

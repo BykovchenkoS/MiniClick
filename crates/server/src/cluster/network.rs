@@ -13,11 +13,13 @@ use serde::{de::DeserializeOwned, Serialize};
 pub struct Network {
     pub client: reqwest::Client,
     pub cluster_id: String,
+    pub placement: Option<String>,
 }
 
 pub struct Connection {
     client: reqwest::Client,
     cluster_id: String,
+    placement: Option<String>,
     target: u64,
     node: BasicNode,
 }
@@ -29,6 +31,7 @@ impl RaftNetworkFactory<TypeConfig> for Network {
         Connection {
             client: self.client.clone(),
             cluster_id: self.cluster_id.clone(),
+            placement: self.placement.clone(),
             target,
             node: node.clone(),
         }
@@ -46,12 +49,17 @@ impl Connection {
         request: &Q,
         option: RPCOption,
     ) -> Result<R, RPCError<u64, BasicNode, E>> {
-        let response = self
+        let request_builder = self
             .client
             .post(format!("http://{}/cluster/{path}", self.node.addr))
             .header("x-miniclick-cluster", &self.cluster_id)
             .timeout(option.hard_ttl())
-            .json(request)
+            .json(request);
+        let request_builder = match &self.placement {
+            Some(placement) => request_builder.header("x-miniclick-placement", placement),
+            None => request_builder,
+        };
+        let response = request_builder
             .send()
             .await
             .map_err(|error| RPCError::Network(NetworkError::new(&error)))?

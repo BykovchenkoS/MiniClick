@@ -77,6 +77,16 @@ pub struct ShardedTableConfig {
     pub key: String,
     #[serde(deserialize_with = "deserialize_addresses")]
     pub shards: BTreeMap<u64, String>,
+    #[serde(default, deserialize_with = "deserialize_id_map")]
+    pub raft_shards: BTreeMap<u64, RaftShardConfig>,
+}
+
+/// Адреса участников Raft-группы одного шарда и её ожидаемая идентичность.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RaftShardConfig {
+    pub cluster_id: String,
+    pub members: Vec<String>,
 }
 
 impl ShardedTableConfig {
@@ -95,7 +105,7 @@ impl ShardedTableConfig {
 }
 
 /// Размещение физической таблицы на этом узле. Порядок ID в TOML произвольный.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalShardConfig {
     pub key: String,
@@ -124,7 +134,13 @@ fn shard_index(key: u64, count: usize) -> Option<usize> {
 fn deserialize_addresses<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<BTreeMap<u64, String>, D::Error> {
-    let members = BTreeMap::<String, String>::deserialize(deserializer)?;
+    deserialize_id_map(deserializer)
+}
+
+fn deserialize_id_map<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<u64, T>, D::Error> {
+    let members = BTreeMap::<String, T>::deserialize(deserializer)?;
     members
         .into_iter()
         .map(|(key, address)| {
@@ -218,11 +234,9 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if !self.local_shards.is_empty()
-            && (self.cluster.is_some() || matches!(self.node.role, Role::Replica { .. }))
-        {
+        if !self.local_shards.is_empty() && matches!(self.node.role, Role::Replica { .. }) {
             return Err(DbError::Unsupported(
-                "local shard placement requires a standalone leader".into(),
+                "local shard placement requires a writable node".into(),
             ));
         }
         for (name, table) in &self.local_shards {
@@ -262,6 +276,23 @@ impl Config {
                 validate_peer_address(address).map_err(|error| {
                     DbError::Syntax(format!("sharding table {name:?}, shard {id}: {error}"))
                 })?;
+            }
+            for (id, group) in &table.raft_shards {
+                if group.cluster_id.trim().is_empty()
+                    || group.members.len() != 3
+                    || group.members.iter().collect::<BTreeSet<_>>().len() != 3
+                    || !table
+                        .shards
+                        .get(id)
+                        .is_some_and(|address| group.members.contains(address))
+                {
+                    return Err(DbError::Syntax(format!(
+                        "sharding table {name:?}, shard {id}: Raft requires a cluster ID and three distinct members including the configured shard address"
+                    )));
+                }
+                for address in &group.members {
+                    validate_peer_address(address)?;
+                }
             }
         }
         if let Some(cluster) = &self.cluster {

@@ -12,6 +12,11 @@ pub enum Command {
         format: InputFormat,
         body: Vec<u8>,
     },
+    ShardInsert {
+        table: types::TableId,
+        format: InputFormat,
+        body: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

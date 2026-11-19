@@ -85,6 +85,7 @@ async fn coordinator(root: &std::path::Path, even: &TestServer, odd: &TestServer
                         (2, even.url.trim_start_matches("http://").into()),
                     ]
                     .into(),
+                    raft_shards: Default::default(),
                 },
             )]
             .into(),

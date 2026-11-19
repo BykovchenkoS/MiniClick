@@ -1,0 +1,13 @@
+listen_addr = "0.0.0.0:8123"
+data_dir = "/data"
+cluster_id = "sharding-raft-even"
+node_id = "shard-even-3"
+
+[cluster]
+id = 3
+members = { "1" = "shard-even-1:8123", "2" = "shard-even-2:8123", "3" = "shard-even-3:8123" }
+
+[local_shards.hits_local]
+key = "user_id"
+shard_id = 1
+shard_ids = [1, 2]

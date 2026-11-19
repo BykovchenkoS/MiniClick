@@ -2,7 +2,7 @@
 
 use super::log_store::{persist, read, storage_error};
 use super::types::{Command, CommandResult, Entry, TypeConfig};
-use crate::{formats::parse_input, AppState};
+use crate::{insert::insert_block, AppState};
 use openraft::storage::RaftStateMachine;
 use openraft::{
     EntryPayload, LogId, RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError,
@@ -28,8 +28,15 @@ pub struct StateMachine {
     app: AppState,
 }
 
-fn execute(app: &AppState, command: &Command) -> types::Result<CommandResult> {
+fn execute(app: &AppState, command: &Command, ordinal: usize) -> types::Result<CommandResult> {
     let result = match command {
+        Command::Sql(sql) if !app.config.local_shards.is_empty() => {
+            // Порядок команд входит в снимок и даёт один ID на всех участниках.
+            let id = uuid::Uuid::from_u128(ordinal as u128).to_string();
+            query::SqlQueryEngine::new(app.catalog.clone())
+                .execute_with_table_id(sql, Some(types::TableId::new(id)))
+                .map(|_| ())
+        }
         Command::Sql(sql) => app.query.execute(sql).map(|_| ()),
         Command::Insert {
             table,
@@ -37,8 +44,24 @@ fn execute(app: &AppState, command: &Command) -> types::Result<CommandResult> {
             body,
         } => (|| {
             let table = app.catalog.get_table(table)?;
-            let block = parse_input(*format, body, &table.definition().schema)?;
-            table.insert(block)
+            insert_block(app, table.as_ref(), *format, body)
+        })(),
+        Command::ShardInsert {
+            table,
+            format,
+            body,
+        } => (|| {
+            let table = app.catalog.get_table_by_id(table)?;
+            if !app
+                .config
+                .local_shards
+                .contains_key(&table.definition().name)
+            {
+                return Err(DbError::Unsupported(
+                    "Raft table has no shard placement".into(),
+                ));
+            }
+            insert_block(app, table.as_ref(), *format, body)
         })(),
     };
     match result {
@@ -62,8 +85,8 @@ fn rebuild(app: &AppState, state: &Applied) -> types::Result<()> {
     for table in app.catalog.list_tables() {
         app.catalog.drop_table(&table.name, false)?;
     }
-    for command in &state.commands {
-        execute(app, command)?;
+    for (index, command) in state.commands.iter().enumerate() {
+        execute(app, command, index + 1)?;
     }
     Ok(())
 }
@@ -172,7 +195,9 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
                     // История фиксируется раньше view: после сбоя view строится заново.
                     persist(&this.path, &next)?;
                     let response = match &entry.payload {
-                        EntryPayload::Normal(command) => execute(&this.app, command)?,
+                        EntryPayload::Normal(command) => {
+                            execute(&this.app, command, next.commands.len())?
+                        }
                         _ => CommandResult {
                             error: None,
                             status: 200,
@@ -320,7 +345,7 @@ mod tests {
             .await
             .unwrap();
         // Имитируем view после незавершённого применения, не вошедшего в историю.
-        execute(&app, &insert(b"99\n")).unwrap();
+        execute(&app, &insert(b"99\n"), 1).unwrap();
         assert_eq!(ids(&app), [1, 2, 99]);
         let reopened = StateMachine::open(path, app.clone()).unwrap();
         assert_eq!(ids(&app), [1, 2]);
@@ -368,9 +393,10 @@ mod tests {
         execute(
             &target,
             &Command::Sql("CREATE TABLE hits (id UInt64) ENGINE = MergeTree ORDER BY id".into()),
+            1,
         )
         .unwrap();
-        execute(&target, &insert(b"99\n")).unwrap();
+        execute(&target, &insert(b"99\n"), 1).unwrap();
         let mut bad_meta = snapshot.meta.clone();
         bad_meta.last_log_id = Some(LogId::new(CommittedLeaderId::new(1, 1), 99));
         assert!(target_machine

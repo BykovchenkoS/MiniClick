@@ -1,6 +1,6 @@
 use crate::{ast::Command, executor, parser, planner};
 use std::sync::Arc;
-use types::{Catalog, QueryEngine, QueryOutput, Result};
+use types::{Catalog, QueryEngine, QueryOutput, Result, TableId};
 
 pub struct SqlQueryEngine {
     catalog: Arc<dyn Catalog>,
@@ -10,10 +10,8 @@ impl SqlQueryEngine {
     pub fn new(catalog: Arc<dyn Catalog>) -> Self {
         Self { catalog }
     }
-}
-
-impl QueryEngine for SqlQueryEngine {
-    fn execute(&self, sql: &str) -> Result<QueryOutput> {
+    /// При воспроизведении CREATE каталог получает стабильный ID из журнала.
+    pub fn execute_with_table_id(&self, sql: &str, id: Option<TableId>) -> Result<QueryOutput> {
         match parser::parse(sql)? {
             Command::Explain(query) => {
                 let plan = planner::plan(query, self.catalog.as_ref())?;
@@ -27,7 +25,12 @@ impl QueryEngine for SqlQueryEngine {
                 definition,
                 if_not_exists,
             } => {
-                self.catalog.create_table(definition, if_not_exists)?;
+                match id {
+                    Some(id) => self
+                        .catalog
+                        .create_table_with_id(definition, id, if_not_exists)?,
+                    None => self.catalog.create_table(definition, if_not_exists)?,
+                }
                 Ok(QueryOutput::Ok)
             }
             Command::Drop { name, if_exists } => {
@@ -39,5 +42,11 @@ impl QueryEngine for SqlQueryEngine {
                 Ok(QueryOutput::Ok)
             }
         }
+    }
+}
+
+impl QueryEngine for SqlQueryEngine {
+    fn execute(&self, sql: &str) -> Result<QueryOutput> {
+        self.execute_with_table_id(sql, None)
     }
 }
