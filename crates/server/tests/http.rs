@@ -228,7 +228,7 @@ async fn sharded_select_groups_and_sorts_globally_and_fails_on_a_late_shard_erro
     )
     .unwrap();
     let explain = sql(&client, &coordinator, &format!("EXPLAIN {grouped}")).await;
-    assert!(explain.contains("parts: 2 / 2, granules: 6 / 6, rows: 6 / 6"));
+    assert!(explain.contains("parts: 2 / 2, granules: 5 / 6, rows: 5 / 6"));
     let response = client
         .post(format!("{}/query", coordinator.url))
         .body(grouped)
@@ -239,6 +239,91 @@ async fn sharded_select_groups_and_sorts_globally_and_fails_on_a_late_shard_erro
     let error = response.json::<serde_json::Value>().await.unwrap();
     assert_eq!(error.as_object().unwrap().len(), 1);
     assert!(error["error"].as_str().unwrap().contains("shard 10"));
+}
+
+#[tokio::test]
+async fn sharded_select_skips_unneeded_shards_and_damaged_granules() {
+    let root = tempfile::tempdir().unwrap();
+    let even_root = root.path().join("even");
+    let even_state = AppState::open(Config {
+        data_dir: even_root.clone(),
+        max_body_bytes: 160,
+        ..Config::default()
+    })
+    .unwrap();
+    let even = TestServer::start(even_state.clone()).await;
+    let odd = TestServer::start(state(&root.path().join("odd"))).await;
+    let coordinator = coordinator(root.path(), &even, &odd).await;
+    let client = client();
+    for shard in [&even, &odd] {
+        sql(&client, shard, "CREATE TABLE hits_local (id UInt64, label String) ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 1").await;
+    }
+    for input in ["2,no\n4,hit\n6,other\n", "1,odd-one\n3,odd-three\n"] {
+        let response = client
+            .post(format!("{}/insert/hits", coordinator.url))
+            .body(input)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{}",
+            response.text().await.unwrap()
+        );
+    }
+    assert_eq!(
+        sql(
+            &client,
+            &coordinator,
+            "SELECT id FROM hits WHERE id = 4 OR id + 0 = 3 ORDER BY id"
+        )
+        .await,
+        "3\n4\n"
+    );
+    assert_eq!(
+        sql(
+            &client,
+            &coordinator,
+            "SELECT count() FROM hits WHERE id = 2 AND id = 3"
+        )
+        .await,
+        "0\n"
+    );
+
+    let entry = even_state.catalog.table_entries().pop().unwrap();
+    let part = even_state
+        .catalog
+        .get_table_by_id(&entry.id)
+        .unwrap()
+        .parts()
+        .unwrap()
+        .pop()
+        .unwrap();
+    let column = std::fs::OpenOptions::new()
+        .write(true)
+        .open(
+            even_root
+                .join("tables")
+                .join(entry.id.as_str())
+                .join(part)
+                .join("label.bin"),
+        )
+        .unwrap();
+    column
+        .set_len(column.metadata().unwrap().len() - 1)
+        .unwrap();
+    drop(column);
+    odd.close().await;
+
+    let query =
+        "SELECT label FROM hits WHERE (4 = id OR id = 2) AND NOT (label = 'no') ORDER BY id";
+    assert_eq!(sql(&client, &coordinator, query).await, "hit\n");
+    let explain = sql(&client, &coordinator, &format!("EXPLAIN {query}")).await;
+    assert!(
+        explain.contains("parts: 1 / 1, granules: 2 / 3, rows: 2 / 3"),
+        "{explain}"
+    );
 }
 
 #[tokio::test]

@@ -25,9 +25,9 @@ use std::{
 };
 use types::{
     Block, BlockStream, Catalog, ColumnDef, DbError, Engine, Result, ScanRequest, ScanStats, Table,
-    TableDefinition, TableEntry, TableId,
+    TableDefinition, TableEntry, TableId, TableSchema,
 };
-use wire::Frame;
+use wire::{Frame, Predicate, ReadRequest};
 
 pub(crate) struct ShardedCatalog {
     local: Arc<dyn Catalog>,
@@ -77,6 +77,7 @@ fn sharded_ddl() -> DbError {
 struct ShardedTable {
     definition: TableDefinition,
     endpoints: Vec<Shard>,
+    config: ShardedTableConfig,
     client: Client,
 }
 
@@ -84,7 +85,38 @@ struct ShardedTable {
 struct Shard {
     id: u64,
     base: Url,
-    table: TableId,
+    table: Option<TableId>,
+}
+
+impl Shard {
+    fn entry(&self, client: &Client, config: &ShardedTableConfig) -> Result<TableEntry> {
+        let metadata = self
+            .base
+            .join("replica/tables")
+            .map_err(|error| shard_error(self.id, error))?;
+        let tables = client
+            .get(metadata)
+            .send()
+            .and_then(|response| response.error_for_status()?.json::<Vec<TableEntry>>())
+            .map_err(|error| shard_error(self.id, error))?;
+        physical_entry(tables, config).map_err(|error| shard_error(self.id, error))
+    }
+
+    fn resolve(
+        mut self,
+        client: &Client,
+        config: &ShardedTableConfig,
+        schema: &TableSchema,
+    ) -> Result<Self> {
+        if self.table.is_none() {
+            let entry = self.entry(client, config)?;
+            if entry.definition.schema != *schema {
+                return Err(shard_error(self.id, "schema differs across shards"));
+            }
+            self.table = Some(entry.id);
+        }
+        Ok(self)
+    }
 }
 
 impl ShardedTable {
@@ -96,54 +128,73 @@ impl ShardedTable {
             .no_proxy()
             .build()
             .map_err(|error| DbError::Internal(format!("shard HTTP client: {error}")))?;
-        let mut definition: Option<TableDefinition> = None;
-        let mut endpoints = Vec::with_capacity(config.shards.len());
-        for (&id, address) in &config.shards {
-            let base = shard_url(address)?;
-            let metadata = base
-                .join("replica/tables")
-                .map_err(|error| shard_error(id, error))?;
-            let tables = client
-                .get(metadata)
-                .send()
-                .and_then(|response| response.error_for_status()?.json::<Vec<TableEntry>>())
-                .map_err(|error| shard_error(id, error))?;
-            let entry = physical_entry(tables, config).map_err(|error| shard_error(id, error))?;
-            if let Some(first) = &definition {
-                if first.schema != entry.definition.schema {
-                    return Err(shard_error(id, "schema differs across shards"));
+        let mut endpoints = config
+            .shards
+            .iter()
+            .map(|(&id, address)| {
+                Ok(Shard {
+                    id,
+                    base: shard_url(address)?,
+                    table: None,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // Для связывания WHERE нужна одна схема. Остальные шарды разрешаются по мере чтения.
+        let mut first_error = None;
+        let mut definition = None;
+        for shard in &mut endpoints {
+            match shard.entry(&client, config) {
+                Ok(entry) => {
+                    shard.table = Some(entry.id);
+                    definition = Some(entry.definition);
+                    break;
                 }
-            } else {
-                definition = Some(entry.definition);
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
             }
-            endpoints.push(Shard {
-                id,
-                base,
-                table: entry.id,
-            });
         }
-        let mut definition = definition
-            .ok_or_else(|| DbError::Internal("sharded table has no destinations".into()))?;
+        let mut definition = definition.ok_or_else(|| {
+            first_error
+                .unwrap_or_else(|| DbError::Internal("sharded table has no destinations".into()))
+        })?;
         name.clone_into(&mut definition.name);
         Ok(Self {
             definition,
             endpoints,
+            config: config.clone(),
             client,
         })
+    }
+
+    fn selected_shards(&self, predicate: Option<&Predicate>) -> Vec<Shard> {
+        let selected: Vec<_> = self
+            .endpoints
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                predicate.is_none_or(|predicate| predicate.may_match_shard(&self.config, *index))
+            })
+            .map(|(_, shard)| shard.clone())
+            .collect();
+        tracing::debug!(table = %self.definition.name, shards = ?selected.iter().map(|shard| shard.id).collect::<Vec<_>>(), "Выбраны шарды");
+        selected
     }
 
     fn request(
         client: &Client,
         shard: &Shard,
         operation: &str,
-        columns: Option<&[String]>,
+        request: &ReadRequest,
     ) -> Result<reqwest::blocking::Response> {
-        let url = table_url(shard.base.clone(), operation, &shard.table)?;
-        let request = match columns {
-            Some(columns) => client.post(url).json(columns),
-            None => client.get(url),
-        };
-        request
+        let table = shard
+            .table
+            .as_ref()
+            .ok_or_else(|| DbError::Internal("shard table ID is missing".into()))?;
+        let url = table_url(shard.base.clone(), operation, table)?;
+        client
+            .post(url)
+            .json(request)
             .send()
             .and_then(reqwest::blocking::Response::error_for_status)
             .map_err(|error| shard_error(shard.id, error))
@@ -167,25 +218,35 @@ impl Table for ShardedTable {
                     .ok_or_else(|| DbError::UnknownColumn(name.clone()))
             })
             .collect::<Result<Vec<_>>>()?;
-        let columns = request.columns.clone();
+        let request = ReadRequest::from(request);
         let client = self.client.clone();
-        let mut endpoints = self.endpoints.clone().into_iter();
+        let config = self.config.clone();
+        let schema = self.definition.schema.clone();
+        let mut endpoints = self
+            .selected_shards(request.predicate.as_ref())
+            .into_iter()
+            .map({
+                let client = client.clone();
+                move |shard| shard.resolve(&client, &config, &schema)
+            });
         let mut active = None;
         let mut done = false;
         Ok(Box::new(std::iter::from_fn(move || {
             if done {
                 return None;
             }
-            let next = next_block(&client, &mut endpoints, &mut active, &columns, &header);
+            let next = next_block(&client, &mut endpoints, &mut active, &request, &header);
             done = !matches!(next, Ok(Some(_)));
             next.transpose()
         })))
     }
 
-    fn explain_scan(&self, _: &ScanRequest) -> Result<ScanStats> {
+    fn explain_scan(&self, request: &ScanRequest) -> Result<ScanStats> {
+        let request = ReadRequest::from(request);
         let mut total = ScanStats::default();
-        for shard in &self.endpoints {
-            let stats: ScanInfo = Self::request(&self.client, shard, "stats", None)?
+        for shard in self.selected_shards(request.predicate.as_ref()) {
+            let shard = shard.resolve(&self.client, &self.config, &self.definition.schema)?;
+            let stats: ScanInfo = Self::request(&self.client, &shard, "stats", &request)?
                 .json()
                 .map_err(|error| shard_error(shard.id, error))?;
             macro_rules! add {
@@ -229,9 +290,9 @@ type ScanLines = Lines<BufReader<reqwest::blocking::Response>>;
 
 fn next_block(
     client: &Client,
-    endpoints: &mut impl Iterator<Item = Shard>,
+    endpoints: &mut impl Iterator<Item = Result<Shard>>,
     active: &mut Option<(u64, ScanLines)>,
-    columns: &[String],
+    request: &ReadRequest,
     header: &[ColumnDef],
 ) -> Result<Option<Block>> {
     loop {
@@ -239,7 +300,8 @@ fn next_block(
             let Some(shard) = endpoints.next() else {
                 return Ok(None);
             };
-            let response = ShardedTable::request(client, &shard, "scan", Some(columns))?;
+            let shard = shard?;
+            let response = ShardedTable::request(client, &shard, "scan", request)?;
             *active = Some((shard.id, BufReader::new(response).lines()));
         }
         if let Some((id, lines)) = active {
@@ -277,17 +339,11 @@ fn physical_table(app: &AppState, id: String) -> Result<Arc<dyn Table>> {
 pub(crate) async fn scan_local(
     State(app): State<AppState>,
     Path(id): Path<String>,
-    columns: std::result::Result<Json<Vec<String>>, JsonRejection>,
+    request: std::result::Result<Json<ReadRequest>, JsonRejection>,
 ) -> std::result::Result<Response, ApiError> {
-    let Json(columns) =
-        columns.map_err(|error| ApiError::new(error.status(), error.body_text()))?;
-    let scan = blocking(move || {
-        physical_table(&app, id)?.scan(&ScanRequest {
-            columns,
-            predicate: None,
-        })
-    })
-    .await?;
+    let Json(request) =
+        request.map_err(|error| ApiError::new(error.status(), error.body_text()))?;
+    let scan = blocking(move || physical_table(&app, id)?.scan(&request.into())).await?;
     let (sender, receiver) = tokio::sync::mpsc::channel(1);
     tokio::task::spawn_blocking(move || {
         for block in scan {
@@ -316,8 +372,10 @@ pub(crate) async fn scan_local(
 pub(crate) async fn stats_local(
     State(app): State<AppState>,
     Path(id): Path<String>,
+    request: std::result::Result<Json<ReadRequest>, JsonRejection>,
 ) -> std::result::Result<Json<ScanInfo>, ApiError> {
-    let stats =
-        blocking(move || physical_table(&app, id)?.explain_scan(&ScanRequest::default())).await?;
+    let Json(request) =
+        request.map_err(|error| ApiError::new(error.status(), error.body_text()))?;
+    let stats = blocking(move || physical_table(&app, id)?.explain_scan(&request.into())).await?;
     Ok(Json(stats.into()))
 }

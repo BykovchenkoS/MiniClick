@@ -153,6 +153,8 @@ pub fn router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(limit));
     // Источником для других реплик служит только лидер.
     if state.config.cluster.is_none() && !state.is_replica() {
+        // Типизированное условие в JSON длиннее исходного SQL.
+        let read_limit = limit.max(64 * 1024);
         router = router
             .route("/replica/ping", get(replica::ping))
             .route("/replica/tables", get(replica::tables))
@@ -164,9 +166,12 @@ pub fn router(state: AppState) -> Router {
             )
             .route(
                 "/shard/scan/{id}",
-                post(sharding::read::scan_local).layer(DefaultBodyLimit::max(limit)),
+                post(sharding::read::scan_local).layer(DefaultBodyLimit::max(read_limit)),
             )
-            .route("/shard/stats/{id}", get(sharding::read::stats_local));
+            .route(
+                "/shard/stats/{id}",
+                post(sharding::read::stats_local).layer(DefaultBodyLimit::max(read_limit)),
+            );
     }
     if state.config.cluster.is_some() {
         // JSON экранирует SQL и расширяет байты INSERT; снимок идёт отдельными чанками.
