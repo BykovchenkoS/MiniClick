@@ -1,4 +1,4 @@
-//! INSERT минует QueryEngine: тело целиком превращается в один проверенный Block.
+//! INSERT минует QueryEngine. Перед записью тело проверяется целиком.
 
 use crate::{
     error::{blocking, ApiError, ErrorResponse},
@@ -11,6 +11,7 @@ use axum::extract::{
     Path, Query, State,
 };
 use serde::Deserialize;
+use types::DbError;
 use utoipa::{IntoParams, ToSchema};
 
 #[derive(Deserialize, IntoParams)]
@@ -43,6 +44,7 @@ impl ToSchema for BinaryBody {}
     (status = 404, description = "Таблица не найдена", body = ErrorResponse),
     (status = 409, description = "Запись на реплику", body = ErrorResponse),
     (status = 413, description = "Превышен лимит тела", body = ErrorResponse),
+    (status = 502, description = "Ошибка связи с шардом, записи или проверки его схемы", body = ErrorResponse),
     (status = 500, description = "Ошибка сервера", body = ErrorResponse)
 ))]
 pub async fn insert(
@@ -53,6 +55,14 @@ pub async fn insert(
 ) -> Result<&'static str, ApiError> {
     let Path(name) = path?;
     let Query(params) = params?;
+    if let Some(table) = app.config.sharding.get(&name) {
+        let client = app
+            .shard_client
+            .as_ref()
+            .ok_or_else(|| DbError::Internal("shard HTTP client is missing".into()))?;
+        crate::sharding::insert(client, table, params.format, body?).await?;
+        return Ok("Ok.\n");
+    }
     if let Some(cluster) = &app.cluster {
         cluster
             .write(crate::cluster::types::Command::Insert {

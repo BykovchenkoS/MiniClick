@@ -10,6 +10,7 @@ mod insert;
 mod meta;
 mod query;
 pub mod replica;
+mod sharding;
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -34,6 +35,7 @@ pub struct AppState {
     pub query: Arc<dyn QueryEngine>,
     pub config: Config,
     pub cluster: Option<Arc<cluster::Cluster>>,
+    pub(crate) shard_client: Option<reqwest::Client>,
     pub(crate) view_gate: Arc<RwLock<()>>,
     pub(crate) view_healthy: Arc<AtomicBool>,
     _cluster_lease: Option<Arc<std::fs::File>>,
@@ -43,11 +45,11 @@ impl AppState {
     /// Только сервер знает одновременно о постоянном Catalog, Query и Storage.
     pub fn open(config: Config) -> Result<Self> {
         config.validate()?;
-        if !config.sharding.is_empty() {
-            return Err(DbError::Unsupported(
-                "sharding routing is not available yet".into(),
-            ));
-        }
+        let shard_client = if config.sharding.is_empty() {
+            None
+        } else {
+            Some(sharding::client()?)
+        };
         let (directory, lease) = if config.cluster.is_some() {
             let (path, lease) = cluster::prepare_view(&config)?;
             (path, Some(lease))
@@ -67,6 +69,7 @@ impl AppState {
             query,
             config,
             cluster: None,
+            shard_client,
             view_gate: Arc::new(RwLock::new(())),
             view_healthy: Arc::new(AtomicBool::new(true)),
             _cluster_lease: lease,
@@ -146,7 +149,11 @@ pub fn router(state: AppState) -> Router {
             .route("/replica/ping", get(replica::ping))
             .route("/replica/tables", get(replica::tables))
             .route("/replica/tables/{id}/parts", get(replica::parts))
-            .route("/replica/tables/{id}/parts/{part}", get(replica::part));
+            .route("/replica/tables/{id}/parts/{part}", get(replica::part))
+            .route(
+                "/shard/insert/{id}",
+                post(sharding::insert_local).layer(DefaultBodyLimit::max(limit)),
+            );
     }
     if state.config.cluster.is_some() {
         // JSON экранирует SQL и расширяет байты INSERT; снимок идёт отдельными чанками.

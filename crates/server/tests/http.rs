@@ -72,6 +72,117 @@ async fn sql(client: &Client, server: &TestServer, query: &str) -> String {
 }
 
 #[tokio::test]
+async fn sharded_http_insert_routes_whole_batches_and_rejects_invalid_input_atomically() {
+    let root = tempfile::tempdir().unwrap();
+    let even = TestServer::start(state(&root.path().join("even"))).await;
+    let odd = TestServer::start(state(&root.path().join("odd"))).await;
+    let client = client();
+    let ddl = "CREATE TABLE hits_local (id UInt64, text String) ENGINE = MergeTree ORDER BY id";
+    for shard in [&even, &odd] {
+        sql(&client, shard, ddl).await;
+    }
+    let coordinator = TestServer::start(
+        AppState::open(Config {
+            data_dir: root.path().join("coordinator"),
+            sharding: [(
+                "hits".into(),
+                server::config::ShardedTableConfig {
+                    local_table: "hits_local".into(),
+                    key: "id".into(),
+                    shards: [
+                        (10, odd.url.trim_start_matches("http://").into()),
+                        (2, even.url.trim_start_matches("http://").into()),
+                    ]
+                    .into(),
+                },
+            )]
+            .into(),
+            ..Config::default()
+        })
+        .unwrap(),
+    )
+    .await;
+    for (format, input) in [
+        ("CSV", "4,four\n2,two\n"),
+        ("TSV", "1\tone\n"),
+        ("JSONEachRow", "{\"text\":\"three\",\"id\":3}\n"),
+        ("CSV", ""),
+    ] {
+        let response = client
+            .post(format!("{}/insert/hits?format={format}", coordinator.url))
+            .body(input)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{}",
+            response.text().await.unwrap()
+        );
+    }
+    for (input, error) in [
+        ("6,six\n7,seven\n", "single shard"),
+        ("6,six\ninvalid,broken\n", "row 2"),
+    ] {
+        let response = client
+            .post(format!("{}/insert/hits", coordinator.url))
+            .body(input)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response.text().await.unwrap().contains(error));
+    }
+    let select = "SELECT id, text FROM hits_local ORDER BY id";
+    assert_eq!(sql(&client, &even, select).await, "2\ttwo\n4\tfour\n");
+    assert_eq!(sql(&client, &odd, select).await, "1\tone\n3\tthree\n");
+
+    sql(&client, &odd, "DROP TABLE hits_local").await;
+    sql(
+        &client,
+        &odd,
+        "CREATE TABLE hits_local (text String, id UInt64) ENGINE = MergeTree ORDER BY id",
+    )
+    .await;
+    let response = client
+        .post(format!("{}/insert/hits", coordinator.url))
+        .body("8,eight\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(response.text().await.unwrap().contains("schema differs"));
+    assert_eq!(sql(&client, &even, select).await, "2\ttwo\n4\tfour\n");
+    assert_eq!(sql(&client, &odd, select).await, "");
+}
+
+#[tokio::test]
+async fn shard_insert_cannot_write_to_a_recreated_table_using_the_old_id() {
+    let root = tempfile::tempdir().unwrap();
+    let app = state(root.path());
+    let catalog = app.catalog.clone();
+    let shard = TestServer::start(app).await;
+    let client = client();
+    let ddl = "CREATE TABLE hits (id UInt64) ENGINE = MergeTree ORDER BY id";
+    sql(&client, &shard, ddl).await;
+    let old_id = catalog.table_entries().pop().unwrap().id;
+    sql(&client, &shard, "DROP TABLE hits").await;
+    sql(&client, &shard, ddl).await;
+    let response = client
+        .post(format!("{}/shard/insert/{old_id}", shard.url))
+        .body("42\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        sql(&client, &shard, "SELECT count() FROM hits").await,
+        "0\n"
+    );
+}
+
+#[tokio::test]
 async fn real_http_create_insert_select_and_atomic_bad_input_for_both_engines() {
     for engine in ["Memory", "MergeTree"] {
         let root = tempfile::tempdir().unwrap();
