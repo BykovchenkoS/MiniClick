@@ -71,19 +71,10 @@ async fn sql(client: &Client, server: &TestServer, query: &str) -> String {
     body
 }
 
-#[tokio::test]
-async fn sharded_http_insert_routes_whole_batches_and_rejects_invalid_input_atomically() {
-    let root = tempfile::tempdir().unwrap();
-    let even = TestServer::start(state(&root.path().join("even"))).await;
-    let odd = TestServer::start(state(&root.path().join("odd"))).await;
-    let client = client();
-    let ddl = "CREATE TABLE hits_local (id UInt64, text String) ENGINE = MergeTree ORDER BY id";
-    for shard in [&even, &odd] {
-        sql(&client, shard, ddl).await;
-    }
-    let coordinator = TestServer::start(
+async fn coordinator(root: &std::path::Path, even: &TestServer, odd: &TestServer) -> TestServer {
+    TestServer::start(
         AppState::open(Config {
-            data_dir: root.path().join("coordinator"),
+            data_dir: root.join("coordinator"),
             sharding: [(
                 "hits".into(),
                 server::config::ShardedTableConfig {
@@ -101,7 +92,20 @@ async fn sharded_http_insert_routes_whole_batches_and_rejects_invalid_input_atom
         })
         .unwrap(),
     )
-    .await;
+    .await
+}
+
+#[tokio::test]
+async fn sharded_http_insert_routes_whole_batches_and_rejects_invalid_input_atomically() {
+    let root = tempfile::tempdir().unwrap();
+    let even = TestServer::start(state(&root.path().join("even"))).await;
+    let odd = TestServer::start(state(&root.path().join("odd"))).await;
+    let client = client();
+    let ddl = "CREATE TABLE hits_local (id UInt64, text String) ENGINE = MergeTree ORDER BY id";
+    for shard in [&even, &odd] {
+        sql(&client, shard, ddl).await;
+    }
+    let coordinator = coordinator(root.path(), &even, &odd).await;
     for (format, input) in [
         ("CSV", "4,four\n2,two\n"),
         ("TSV", "1\tone\n"),
@@ -155,6 +159,86 @@ async fn sharded_http_insert_routes_whole_batches_and_rejects_invalid_input_atom
     assert!(response.text().await.unwrap().contains("schema differs"));
     assert_eq!(sql(&client, &even, select).await, "2\ttwo\n4\tfour\n");
     assert_eq!(sql(&client, &odd, select).await, "");
+}
+
+#[tokio::test]
+async fn sharded_select_groups_and_sorts_globally_and_fails_on_a_late_shard_error() {
+    let root = tempfile::tempdir().unwrap();
+    let even = TestServer::start(state(&root.path().join("even"))).await;
+    let odd_root = root.path().join("odd");
+    let odd_state = state(&odd_root);
+    let odd = TestServer::start(odd_state.clone()).await;
+    let coordinator = coordinator(root.path(), &even, &odd).await;
+    let client = client();
+    for shard in [&even, &odd] {
+        sql(&client, shard, "CREATE TABLE hits_local (id UInt64, label String, amount Int64) ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 1").await;
+    }
+    for input in [
+        "2,shared,20\n4,even,50\n6,shared,1000\n",
+        "1,shared,40\n3,odd,55\n5,odd,1\n",
+    ] {
+        let response = client
+            .post(format!("{}/insert/hits", coordinator.url))
+            .body(input)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{}",
+            response.text().await.unwrap()
+        );
+    }
+    let grouped = "SELECT label, sum(amount) AS total, count() AS n FROM hits WHERE id < 6 GROUP BY label ORDER BY total DESC, label ASC LIMIT 2";
+    assert_eq!(
+        sql(&client, &coordinator, grouped).await,
+        "shared\t60\t2\nodd\t56\t2\n"
+    );
+    assert_eq!(
+        sql(
+            &client,
+            &coordinator,
+            "SELECT label FROM hits ORDER BY id DESC LIMIT 2"
+        )
+        .await,
+        "shared\nodd\n"
+    );
+    assert_eq!(
+        sql(&client, &coordinator, "SELECT count() FROM hits").await,
+        "6\n"
+    );
+
+    let entry = odd_state.catalog.table_entries().pop().unwrap();
+    let part = odd_state
+        .catalog
+        .get_table_by_id(&entry.id)
+        .unwrap()
+        .parts()
+        .unwrap()
+        .pop()
+        .unwrap();
+    std::fs::write(
+        odd_root
+            .join("tables")
+            .join(entry.id.as_str())
+            .join(part)
+            .join("amount.bin"),
+        b"broken column",
+    )
+    .unwrap();
+    let explain = sql(&client, &coordinator, &format!("EXPLAIN {grouped}")).await;
+    assert!(explain.contains("parts: 2 / 2, granules: 6 / 6, rows: 6 / 6"));
+    let response = client
+        .post(format!("{}/query", coordinator.url))
+        .body(grouped)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let error = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(error.as_object().unwrap().len(), 1);
+    assert!(error["error"].as_str().unwrap().contains("shard 10"));
 }
 
 #[tokio::test]

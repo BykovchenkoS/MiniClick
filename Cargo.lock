@@ -1504,6 +1504,7 @@ dependencies = [
  "catalog",
  "clap",
  "csv",
+ "futures-util",
  "openraft",
  "query",
  "replication",

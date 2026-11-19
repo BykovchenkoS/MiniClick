@@ -1,5 +1,7 @@
 //! Маршрутизация одной атомарной вставки на физический шард.
 
+pub(crate) mod read;
+
 use crate::{
     config::ShardedTableConfig,
     error::{blocking, ApiError},
@@ -37,8 +39,7 @@ pub(crate) async fn insert(
 ) -> Result<(), ApiError> {
     let mut entries = BTreeMap::new();
     for (&id, address) in &table.shards {
-        let base =
-            Url::parse(&format!("http://{address}/")).map_err(|error| shard_error(id, error))?;
+        let base = shard_url(address).map_err(|error| shard_error(id, error))?;
         let metadata = client
             .get(
                 base.join("replica/tables")
@@ -57,23 +58,7 @@ pub(crate) async fn insert(
             .json::<Vec<TableEntry>>()
             .await
             .map_err(|error| shard_error(id, error))?;
-        let entry = tables
-            .into_iter()
-            .find(|entry| entry.definition.name == table.local_table)
-            .ok_or_else(|| shard_error(id, format!("missing table {}", table.local_table)))?;
-        if entry.definition.engine != Engine::MergeTree
-            || entry
-                .definition
-                .schema
-                .column(&table.key)
-                .map(|col| col.data_type)
-                != Some(DataType::UInt64)
-        {
-            return Err(shard_error(
-                id,
-                format!("expected MergeTree with UInt64 key {}", table.key),
-            ));
-        }
+        let entry = physical_entry(tables, table).map_err(|error| shard_error(id, error))?;
         entries.insert(id, (base, entry));
     }
     let (&first_id, (_, first)) = entries
@@ -121,15 +106,11 @@ pub(crate) async fn insert(
         return Ok(());
     };
 
-    let (mut url, entry) = entries
+    let (url, entry) = entries
         .remove(&id)
         .ok_or_else(|| DbError::Internal("destination shard metadata is missing".into()))?;
-    url.path_segments_mut()
-        .map_err(|_| DbError::Internal("invalid shard URL".into()))?
-        .pop_if_empty()
-        .extend(["shard", "insert", entry.id.as_str()]);
     let response = client
-        .post(url)
+        .post(table_url(url, "insert", &entry.id)?)
         .query(&[("format", format)])
         .body(body)
         .send()
@@ -143,6 +124,43 @@ pub(crate) async fn insert(
         )),
         status => Err(shard_error(id, format!("INSERT returned {status}"))),
     }
+}
+
+fn shard_url(address: &str) -> types::Result<Url> {
+    Url::parse(&format!("http://{address}/"))
+        .map_err(|error| DbError::Syntax(format!("invalid shard URL: {error}")))
+}
+
+fn table_url(mut base: Url, operation: &str, id: &TableId) -> types::Result<Url> {
+    base.path_segments_mut()
+        .map_err(|_| DbError::Internal("invalid shard URL".into()))?
+        .pop_if_empty()
+        .extend(["shard", operation, id.as_str()]);
+    Ok(base)
+}
+
+fn physical_entry(
+    tables: Vec<TableEntry>,
+    table: &ShardedTableConfig,
+) -> types::Result<TableEntry> {
+    let entry = tables
+        .into_iter()
+        .find(|entry| entry.definition.name == table.local_table)
+        .ok_or_else(|| DbError::UnknownTable(table.local_table.clone()))?;
+    if entry.definition.engine != Engine::MergeTree
+        || entry
+            .definition
+            .schema
+            .column(&table.key)
+            .map(|col| col.data_type)
+            != Some(DataType::UInt64)
+    {
+        return Err(DbError::TypeMismatch(format!(
+            "expected MergeTree with UInt64 key {}",
+            table.key
+        )));
+    }
+    Ok(entry)
 }
 
 fn shard_error(id: u64, error: impl std::fmt::Display) -> ApiError {

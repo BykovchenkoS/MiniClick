@@ -6,7 +6,7 @@ use crate::{
 };
 use axum::extract::{rejection::PathRejection, Path, State};
 use axum::Json;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use types::{Codec, DbError, Engine, ScanRequest, ScanStats, TableDefinition};
 use utoipa::ToSchema;
 
@@ -66,7 +66,7 @@ impl From<TableDefinition> for TableInfo {
     }
 }
 
-#[derive(Serialize, ToSchema)]
+#[derive(Deserialize, Serialize, ToSchema)]
 pub struct ScanInfo {
     pub parts_total: usize,
     pub parts_selected: usize,

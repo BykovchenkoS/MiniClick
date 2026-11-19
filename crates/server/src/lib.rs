@@ -63,7 +63,15 @@ impl AppState {
                 (Engine::MergeTree, Arc::new(storage::MergeTreeFactory)),
             ],
         )?);
-        let query = Arc::new(::query::SqlQueryEngine::new(catalog.clone()));
+        let query_catalog = if config.sharding.is_empty() {
+            catalog.clone()
+        } else {
+            Arc::new(sharding::read::ShardedCatalog::new(
+                catalog.clone(),
+                config.sharding.clone(),
+            ))
+        };
+        let query = Arc::new(::query::SqlQueryEngine::new(query_catalog));
         Ok(Self {
             catalog,
             query,
@@ -153,7 +161,12 @@ pub fn router(state: AppState) -> Router {
             .route(
                 "/shard/insert/{id}",
                 post(sharding::insert_local).layer(DefaultBodyLimit::max(limit)),
-            );
+            )
+            .route(
+                "/shard/scan/{id}",
+                post(sharding::read::scan_local).layer(DefaultBodyLimit::max(limit)),
+            )
+            .route("/shard/stats/{id}", get(sharding::read::stats_local));
     }
     if state.config.cluster.is_some() {
         // JSON экранирует SQL и расширяет байты INSERT; снимок идёт отдельными чанками.
