@@ -98,8 +98,25 @@ async fn coordinator(root: &std::path::Path, even: &TestServer, odd: &TestServer
 #[tokio::test]
 async fn sharded_http_insert_routes_whole_batches_and_rejects_invalid_input_atomically() {
     let root = tempfile::tempdir().unwrap();
-    let even = TestServer::start(state(&root.path().join("even"))).await;
-    let odd = TestServer::start(state(&root.path().join("odd"))).await;
+    let shard_state = |name, shard_id| {
+        AppState::open(Config {
+            data_dir: root.path().join(name),
+            local_shards: [(
+                "hits_local".into(),
+                server::config::LocalShardConfig {
+                    key: "id".into(),
+                    shard_id,
+                    shard_ids: vec![10, 2],
+                },
+            )]
+            .into(),
+            ..Config::default()
+        })
+        .unwrap()
+    };
+    let even_state = shard_state("even", 2);
+    let even = TestServer::start(even_state.clone()).await;
+    let odd = TestServer::start(shard_state("odd", 10)).await;
     let client = client();
     let ddl = "CREATE TABLE hits_local (id UInt64, text String) ENGINE = MergeTree ORDER BY id";
     for shard in [&even, &odd] {
@@ -142,6 +159,38 @@ async fn sharded_http_insert_routes_whole_batches_and_rejects_invalid_input_atom
     assert_eq!(sql(&client, &even, select).await, "2\ttwo\n4\tfour\n");
     assert_eq!(sql(&client, &odd, select).await, "1\tone\n3\tthree\n");
 
+    let entry = even_state.catalog.table_entries().pop().unwrap();
+    for path in [
+        "/insert/hits_local".to_owned(),
+        format!("/shard/insert/{}", entry.id),
+    ] {
+        let response = client
+            .post(format!("{}{path}", even.url))
+            .body("8,eight\n9,nine\n")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error = response.text().await.unwrap();
+        assert!(
+            error.contains("row 2") && error.contains("id=9") && error.contains("shard 2"),
+            "{error}"
+        );
+        assert_eq!(sql(&client, &even, select).await, "2\ttwo\n4\tfour\n");
+        assert_eq!(sql(&client, &odd, select).await, "1\tone\n3\tthree\n");
+    }
+    let direct = client
+        .post(format!("{}/insert/hits_local", even.url))
+        .body("8,eight\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(direct.status(), StatusCode::OK);
+    assert_eq!(
+        sql(&client, &coordinator, "SELECT text FROM hits WHERE id = 8").await,
+        "eight\n"
+    );
+
     sql(&client, &odd, "DROP TABLE hits_local").await;
     sql(
         &client,
@@ -157,7 +206,10 @@ async fn sharded_http_insert_routes_whole_batches_and_rejects_invalid_input_atom
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert!(response.text().await.unwrap().contains("schema differs"));
-    assert_eq!(sql(&client, &even, select).await, "2\ttwo\n4\tfour\n");
+    assert_eq!(
+        sql(&client, &even, select).await,
+        "2\ttwo\n4\tfour\n8\teight\n"
+    );
     assert_eq!(sql(&client, &odd, select).await, "");
 }
 

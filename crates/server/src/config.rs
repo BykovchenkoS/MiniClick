@@ -56,6 +56,8 @@ struct FileConfig {
     cluster: Option<ClusterConfig>,
     #[serde(default)]
     sharding: BTreeMap<String, ShardedTableConfig>,
+    #[serde(default)]
+    local_shards: BTreeMap<String, LocalShardConfig>,
 }
 
 /// Фиксированный состав Raft; DNS разрешается только при сетевом соединении.
@@ -88,9 +90,35 @@ impl ShardedTableConfig {
     }
 
     pub(crate) fn shard_index(&self, key: u64) -> Option<usize> {
-        key.checked_rem(self.shards.len() as u64)
-            .map(|index| index as usize)
+        shard_index(key, self.shards.len())
     }
+}
+
+/// Размещение физической таблицы на этом узле. Порядок ID в TOML произвольный.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalShardConfig {
+    pub key: String,
+    pub shard_id: u64,
+    pub shard_ids: Vec<u64>,
+}
+
+impl LocalShardConfig {
+    /// Позиция локального шарда в том же порядке ID, который использует координатор.
+    pub(crate) fn index(&self) -> usize {
+        self.shard_ids
+            .iter()
+            .filter(|&&id| id < self.shard_id)
+            .count()
+    }
+
+    pub(crate) fn shard_index(&self, key: u64) -> Option<usize> {
+        shard_index(key, self.shard_ids.len())
+    }
+}
+
+fn shard_index(key: u64, count: usize) -> Option<usize> {
+    key.checked_rem(count as u64).map(|index| index as usize)
 }
 
 fn deserialize_addresses<'de, D: serde::Deserializer<'de>>(
@@ -117,6 +145,8 @@ pub struct Config {
     pub cluster: Option<ClusterConfig>,
     /// Карта логических таблиц по регистрозависимым именам.
     pub sharding: BTreeMap<String, ShardedTableConfig>,
+    /// Правила размещения по именам физических таблиц.
+    pub local_shards: BTreeMap<String, LocalShardConfig>,
 }
 
 impl Default for Config {
@@ -133,6 +163,7 @@ impl Default for Config {
             max_body_bytes: 256 * 1024 * 1024,
             cluster: None,
             sharding: BTreeMap::new(),
+            local_shards: BTreeMap::new(),
         }
     }
 }
@@ -152,6 +183,7 @@ impl Config {
         let mut config = Self {
             cluster: file.cluster,
             sharding: file.sharding,
+            local_shards: file.local_shards,
             ..Self::default()
         };
         if let Some(addr) = cli.listen_addr.or(file.listen_addr) {
@@ -186,6 +218,27 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if !self.local_shards.is_empty()
+            && (self.cluster.is_some() || matches!(self.node.role, Role::Replica { .. }))
+        {
+            return Err(DbError::Unsupported(
+                "local shard placement requires a standalone leader".into(),
+            ));
+        }
+        for (name, table) in &self.local_shards {
+            let ids: BTreeSet<_> = table.shard_ids.iter().copied().collect();
+            if name.trim().is_empty()
+                || table.key.trim().is_empty()
+                || ids.contains(&0)
+                || !ids.contains(&table.shard_id)
+                || ids.len() != table.shard_ids.len()
+                || self.sharding.contains_key(name)
+            {
+                return Err(DbError::Syntax(format!(
+                    "local shard table {name:?} requires a key, distinct positive shard IDs including its own, and a name distinct from logical tables"
+                )));
+            }
+        }
         if !self.sharding.is_empty()
             && (self.cluster.is_some() || matches!(self.node.role, Role::Replica { .. }))
         {

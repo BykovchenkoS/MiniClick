@@ -14,7 +14,7 @@ x-node: &node
 
 x-shard: &shard
   <<: *node
-  command: ["--listen-addr", "0.0.0.0:8123", "--data-dir", "/data"]
+  command: ["--config", "/app/shard.toml"]
 
 services:
   coordinator:
@@ -36,6 +36,7 @@ services:
     ports:
       - "127.0.0.1:${MINICLICK_SHARD_EVEN_PORT:-8131}:8123"
     volumes:
+      - ./deploy/sharding-even.toml:/app/shard.toml:ro
       - shard-even-data:/data
 
   shard-odd:
@@ -43,6 +44,7 @@ services:
     ports:
       - "127.0.0.1:${MINICLICK_SHARD_ODD_PORT:-8132}:8123"
     volumes:
+      - ./deploy/sharding-odd.toml:/app/shard.toml:ro
       - shard-odd-data:/data
 
 volumes:

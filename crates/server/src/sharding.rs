@@ -6,7 +6,7 @@ use crate::{
     config::ShardedTableConfig,
     error::{blocking, ApiError},
     formats::{parse_input, InputFormat},
-    insert::InsertParams,
+    insert::{insert_block, InsertParams},
     AppState,
 };
 use axum::{
@@ -186,8 +186,7 @@ pub(crate) async fn insert_local(
                 "shard table must use MergeTree".into(),
             ));
         }
-        let block = parse_input(params.format, &body, &table.definition().schema)?;
-        table.insert(block)
+        insert_block(&app, table.as_ref(), params.format, &body)
     })
     .await?;
     Ok("Ok.\n")

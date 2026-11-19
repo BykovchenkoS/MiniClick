@@ -1,0 +1,8 @@
+listen_addr = "0.0.0.0:8123"
+data_dir = "/data"
+node_id = "shard-even"
+
+[local_shards.hits_local]
+key = "user_id"
+shard_id = 1
+shard_ids = [1, 2]

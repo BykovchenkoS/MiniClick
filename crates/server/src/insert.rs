@@ -11,7 +11,7 @@ use axum::extract::{
     Path, Query, State,
 };
 use serde::Deserialize;
-use types::DbError;
+use types::{ColumnData, DbError, Engine, Table};
 use utoipa::{IntoParams, ToSchema};
 
 #[derive(Deserialize, IntoParams)]
@@ -40,7 +40,7 @@ impl ToSchema for BinaryBody {}
     InsertParams, ("table" = String, Path, description = "Имя существующей таблицы")
 ), request_body(content = BinaryBody, content_type = "application/octet-stream", description = "Файл без заголовка; JSONEachRow — объекты с именами колонок"), responses(
     (status = 200, description = "Вставка завершена", body = String, content_type = "text/plain"),
-    (status = 400, description = "Ошибочные данные или формат", body = ErrorResponse),
+    (status = 400, description = "Ошибочные данные, формат или ключ чужого шарда", body = ErrorResponse),
     (status = 404, description = "Таблица не найдена", body = ErrorResponse),
     (status = 409, description = "Запись на реплику", body = ErrorResponse),
     (status = 413, description = "Превышен лимит тела", body = ErrorResponse),
@@ -77,9 +77,45 @@ pub async fn insert(
     let body = body?;
     blocking(move || {
         let table = app.catalog.get_table(&name)?;
-        let block = parse_input(params.format, &body, &table.definition().schema)?;
-        table.insert(block)
+        insert_block(&app, table.as_ref(), params.format, &body)
     })
     .await?;
     Ok("Ok.\n")
+}
+
+/// Проверяет размещение всех строк при записи как по имени, так и по ID.
+pub(crate) fn insert_block(
+    app: &AppState,
+    table: &dyn Table,
+    format: InputFormat,
+    body: &[u8],
+) -> types::Result<()> {
+    let definition = table.definition();
+    let block = parse_input(format, body, &definition.schema)?;
+    if let Some(placement) = app.config.local_shards.get(&definition.name) {
+        let Some(ColumnData::UInt64(keys)) = block.column(&placement.key) else {
+            return Err(DbError::TypeMismatch(format!(
+                "shard key {} must be UInt64",
+                placement.key
+            )));
+        };
+        if definition.engine != Engine::MergeTree {
+            return Err(DbError::Unsupported(
+                "shard table must use MergeTree".into(),
+            ));
+        }
+        let local_index = Some(placement.index());
+        for (index, &key) in keys.iter().enumerate() {
+            if placement.shard_index(key) != local_index {
+                return Err(DbError::BadInput {
+                    row: index + 1,
+                    message: format!(
+                        "key {}={key} does not belong to shard {}",
+                        placement.key, placement.shard_id
+                    ),
+                });
+            }
+        }
+    }
+    table.insert(block)
 }

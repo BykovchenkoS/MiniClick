@@ -4,6 +4,8 @@
 предоставляет логическую таблицу `hits`. Ключ `user_id` направляет чётные ID
 на `shard-even`, а нечётные на `shard-odd`. Карта задана в
 [`deploy/sharding-coordinator.toml`](../deploy/sharding-coordinator.toml).
+Каждый шард сверяет ключи со своим правилом размещения.
+[`sharding-even.toml`](../deploy/sharding-even.toml) · [`sharding-odd.toml`](../deploy/sharding-odd.toml)
 
 ## 1. Запуск
 
@@ -54,6 +56,11 @@ SELECT user_id FROM hits_local ORDER BY user_id
 ```
 
 Ожидаемые ID на чётном шарде — `2, 4, 6`, на нечётном — `1, 3, 5`.
+
+Чтобы проверить защиту от записи на чужой шард, загрузите
+[`sharding-odd.csv`](../deploy/sharding-odd.csv) через `POST /insert/{table}`
+на чётном шарде с `table = hits_local`. Запрос вернёт `400`. Повторный
+SELECT на чётном шарде вернёт прежние строки.
 
 ## 4. Распределённый SELECT
 

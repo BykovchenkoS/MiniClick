@@ -220,3 +220,24 @@ fn sharding_coordinator_requires_a_standalone_leader() {
         ));
     }
 }
+
+#[test]
+fn local_shard_configuration_requires_a_valid_id_set() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("config.toml");
+    let header = "[local_shards.hits_local]\nkey = 'id'\nshard_id = 2\n";
+    std::fs::write(&path, format!("{header}shard_ids = [10, 2]")).unwrap();
+    let config = Config::load(cli(&[]), root.path()).unwrap();
+    assert_eq!(config.local_shards["hits_local"].shard_ids, [10, 2]);
+
+    for ids in ["[]", "[10]", "[2, 2]", "[0, 2]"] {
+        std::fs::write(&path, format!("{header}shard_ids = {ids}")).unwrap();
+        assert!(
+            matches!(
+                Config::load(cli(&[]), root.path()),
+                Err(types::DbError::Syntax(_))
+            ),
+            "{ids}"
+        );
+    }
+}
