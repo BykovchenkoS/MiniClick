@@ -1,0 +1,51 @@
+name: miniclick-sharding
+
+x-node: &node
+  image: miniclick:sharding-demo
+  build: .
+  environment:
+    RUST_LOG: info
+  stop_grace_period: 15s
+  healthcheck:
+    test: ["CMD", "curl", "--fail", "--silent", "--max-time", "2", "http://127.0.0.1:8123/ping"]
+    interval: 2s
+    timeout: 3s
+    retries: 15
+
+x-shard: &shard
+  <<: *node
+  command: ["--listen-addr", "0.0.0.0:8123", "--data-dir", "/data"]
+
+services:
+  coordinator:
+    <<: *node
+    command: ["--config", "/app/coordinator.toml"]
+    depends_on:
+      shard-even:
+        condition: service_healthy
+      shard-odd:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${MINICLICK_COORDINATOR_PORT:-8130}:8123"
+    volumes:
+      - ./deploy/sharding-coordinator.toml:/app/coordinator.toml:ro
+      - coordinator-data:/data
+
+  shard-even:
+    <<: *shard
+    ports:
+      - "127.0.0.1:${MINICLICK_SHARD_EVEN_PORT:-8131}:8123"
+    volumes:
+      - shard-even-data:/data
+
+  shard-odd:
+    <<: *shard
+    ports:
+      - "127.0.0.1:${MINICLICK_SHARD_ODD_PORT:-8132}:8123"
+    volumes:
+      - shard-odd-data:/data
+
+volumes:
+  coordinator-data:
+  shard-even-data:
+  shard-odd-data:

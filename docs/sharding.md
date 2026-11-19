@@ -1,0 +1,110 @@
+# Демо шардирования через Docker и Swagger
+
+Два шарда хранят свою часть таблицы `hits_local` в MergeTree. Координатор
+предоставляет логическую таблицу `hits`. Ключ `user_id` направляет чётные ID
+на `shard-even`, а нечётные на `shard-odd`. Карта задана в
+[`deploy/sharding-coordinator.toml`](../deploy/sharding-coordinator.toml).
+
+## 1. Запуск
+
+Запустите стенд из корня репозитория.
+
+```bash
+docker compose -f compose.sharding.yaml up -d --build --wait
+```
+
+| Узел | Swagger UI |
+|---|---|
+| Координатор | <http://localhost:8130/swagger-ui/> |
+| Шард для чётных ID | <http://localhost:8131/swagger-ui/> |
+| Шард для нечётных ID | <http://localhost:8132/swagger-ui/> |
+
+Каждый шаг в Swagger выполняется через **Try it out** и **Execute**. Команды SQL
+вставляются в тело `POST /query` с форматом ответа `TSV`.
+
+## 2. Создание физической таблицы
+
+Выполните запрос на **обоих шардах**. Ответ каждого узла будет `200` и `Ok.`.
+
+```sql
+CREATE TABLE IF NOT EXISTS hits_local (
+    user_id UInt64,
+    category String,
+    amount Int64
+) ENGINE = MergeTree
+ORDER BY user_id
+SETTINGS index_granularity = 1
+```
+
+## 3. Загрузка двух блоков через координатор
+
+Откройте `POST /insert/{table}` на **координаторе**, укажите `table = hits`
+и `format = CSV`. Загрузите файлы по очереди отдельными запросами.
+
+- [`sharding-even.csv`](../deploy/sharding-even.csv) содержит чётные ID.
+- [`sharding-odd.csv`](../deploy/sharding-odd.csv) содержит нечётные ID.
+
+Каждая загрузка возвращает `200` и `Ok.`. Один запрос принимает строки
+для одного шарда. Повторная загрузка файла добавит те же строки ещё раз.
+
+Локальное размещение можно проверить через `POST /query` на каждом шарде.
+
+```sql
+SELECT user_id FROM hits_local ORDER BY user_id
+```
+
+Ожидаемые ID на чётном шарде — `2, 4, 6`, на нечётном — `1, 3, 5`.
+
+## 4. Распределённый SELECT
+
+Отправьте запрос на **координатор**, чтобы получить две группы с наибольшей суммой.
+
+```sql
+SELECT category, sum(amount) AS total, count() AS n
+FROM hits
+WHERE user_id < 6
+GROUP BY category
+ORDER BY total DESC, category ASC
+LIMIT 2
+```
+
+При однократной загрузке каждого файла результат содержит две строки.
+
+```text
+news    60    2
+blog    56    2
+```
+
+Группа `news` объединяет строки с ID 1 и 2 из разных шардов. Строка с ID 6
+отфильтровывается до агрегации.
+
+## 5. EXPLAIN и точная фильтрация
+
+Проверьте отсечение через `EXPLAIN` на **координаторе**.
+
+```sql
+EXPLAIN SELECT user_id, category, amount FROM hits WHERE user_id = 4
+```
+
+Последняя строка плана содержит статистику чётного шарда.
+
+```text
+parts: 1 / 1, granules: 2 / 3, rows: 2 / 3 (selected / total; before WHERE)
+```
+
+Координатор выбирает чётный шард, и статистика относится к его трём гранулам.
+Разреженный индекс оставляет две гранулы, чьи диапазоны могут содержать ключ 4.
+Выполните тот же запрос без `EXPLAIN`. Точный `WHERE` вернёт одну строку.
+
+```text
+4    shop    50
+```
+
+## Остановка
+
+```bash
+docker compose -f compose.sharding.yaml down
+```
+
+Данные в томах сохраняются. После повторного запуска можно сразу выполнить
+SELECT и EXPLAIN над уже загруженными строками.
