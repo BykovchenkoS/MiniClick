@@ -80,6 +80,7 @@ async fn coordinator(root: &std::path::Path, even: &TestServer, odd: &TestServer
                 server::config::ShardedTableConfig {
                     local_table: "hits_local".into(),
                     key: "id".into(),
+                    schema: None,
                     shards: [
                         (10, odd.url.trim_start_matches("http://").into()),
                         (2, even.url.trim_start_matches("http://").into()),

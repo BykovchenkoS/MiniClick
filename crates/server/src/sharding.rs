@@ -21,7 +21,7 @@ use axum::{
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use std::{collections::BTreeMap, time::Duration};
-use types::{ColumnData, DataType, DbError, Engine, TableEntry, TableId};
+use types::{ColumnData, DataType, DbError, Engine, TableEntry, TableId, TableSchema};
 
 pub(crate) fn client() -> types::Result<Client> {
     Client::builder()
@@ -39,35 +39,46 @@ pub(crate) async fn insert(
     format: InputFormat,
     body: Bytes,
 ) -> Result<(), ApiError> {
-    let mut entries = BTreeMap::new();
-    for (&id, address) in &table.shards {
-        let group = table.raft_shards.get(&id);
-        let base = match group {
-            Some(group) => leader(client, group)
-                .await
-                .map_err(|error| shard_error(id, error))?,
-            None => shard_url(address).map_err(|error| shard_error(id, error))?,
-        };
-        let metadata = client
-            .get(
-                base.join(metadata_path(group.is_some()))
-                    .map_err(|error| shard_error(id, error))?,
-            )
-            .send()
-            .await
-            .map_err(|error| shard_error(id, error))?;
-        if metadata.status() != StatusCode::OK {
-            return Err(shard_error(
-                id,
-                format!("metadata returned {}", metadata.status()),
-            ));
+    let target = if let Some(schema) = &table.schema {
+        match insert_shard(table, schema, format, &body).await? {
+            Some(id) => {
+                let (url, entry) = load_shard(client, table, id).await?;
+                Some((id, url, entry))
+            }
+            None => None,
         }
-        let tables = metadata
-            .json::<Vec<TableEntry>>()
-            .await
-            .map_err(|error| shard_error(id, error))?;
-        let entry = physical_entry(tables, table).map_err(|error| shard_error(id, error))?;
-        entries.insert(id, (base, entry));
+    } else {
+        legacy_insert_target(client, table, format, &body).await?
+    };
+    let Some((id, url, entry)) = target else {
+        return Ok(());
+    };
+    let response = client
+        .post(table_url(url, "insert", &entry.id)?)
+        .query(&[("format", format)])
+        .body(body)
+        .send()
+        .await
+        .map_err(|error| shard_error(id, format!("INSERT outcome unknown: {error}")))?;
+    match response.status() {
+        StatusCode::OK => Ok(()),
+        StatusCode::PAYLOAD_TOO_LARGE => Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("shard {id} rejected the INSERT body size"),
+        )),
+        status => Err(shard_error(id, format!("INSERT returned {status}"))),
+    }
+}
+
+async fn legacy_insert_target(
+    client: &Client,
+    table: &ShardedTableConfig,
+    format: InputFormat,
+    body: &Bytes,
+) -> Result<Option<(u64, Url, TableEntry)>, ApiError> {
+    let mut entries = BTreeMap::new();
+    for &id in table.shards.keys() {
+        entries.insert(id, load_shard(client, table, id).await?);
     }
     let (&first_id, (_, first)) = entries
         .first_key_value()
@@ -81,10 +92,65 @@ pub(crate) async fn insert(
         }
     }
 
-    let schema = first.definition.schema.clone();
+    let Some(id) = insert_shard(table, &first.definition.schema, format, body).await? else {
+        return Ok(None);
+    };
+    let (url, entry) = entries
+        .remove(&id)
+        .ok_or_else(|| DbError::Internal("destination shard metadata is missing".into()))?;
+    Ok(Some((id, url, entry)))
+}
+
+async fn load_shard(
+    client: &Client,
+    table: &ShardedTableConfig,
+    id: u64,
+) -> Result<(Url, TableEntry), ApiError> {
+    let group = table.raft_shards.get(&id);
+    let base = match group {
+        Some(group) => leader(client, group)
+            .await
+            .map_err(|error| shard_error(id, error))?,
+        None => {
+            let address = table
+                .shards
+                .get(&id)
+                .ok_or_else(|| DbError::Internal("destination shard address is missing".into()))?;
+            shard_url(address).map_err(|error| shard_error(id, error))?
+        }
+    };
+    let metadata = client
+        .get(
+            base.join(metadata_path(group.is_some()))
+                .map_err(|error| shard_error(id, error))?,
+        )
+        .send()
+        .await
+        .map_err(|error| shard_error(id, error))?;
+    if metadata.status() != StatusCode::OK {
+        return Err(shard_error(
+            id,
+            format!("metadata returned {}", metadata.status()),
+        ));
+    }
+    let tables = metadata
+        .json::<Vec<TableEntry>>()
+        .await
+        .map_err(|error| shard_error(id, error))?;
+    let entry = physical_entry(tables, table).map_err(|error| shard_error(id, error))?;
+    Ok((base, entry))
+}
+
+async fn insert_shard(
+    table: &ShardedTableConfig,
+    schema: &TableSchema,
+    format: InputFormat,
+    body: &Bytes,
+) -> Result<Option<u64>, ApiError> {
+    let schema = schema.clone();
     let table = table.clone();
     let input = body.clone();
-    let shard = blocking(move || {
+    blocking(move || {
         let block = parse_input(format, &input, &schema)?;
         let Some(ColumnData::UInt64(keys)) = block.column(&table.key) else {
             return Err(DbError::Internal(
@@ -109,29 +175,7 @@ pub(crate) async fn insert(
         }
         Ok(Some(id))
     })
-    .await?;
-    let Some(id) = shard else {
-        return Ok(());
-    };
-
-    let (url, entry) = entries
-        .remove(&id)
-        .ok_or_else(|| DbError::Internal("destination shard metadata is missing".into()))?;
-    let response = client
-        .post(table_url(url, "insert", &entry.id)?)
-        .query(&[("format", format)])
-        .body(body)
-        .send()
-        .await
-        .map_err(|error| shard_error(id, format!("INSERT outcome unknown: {error}")))?;
-    match response.status() {
-        StatusCode::OK => Ok(()),
-        StatusCode::PAYLOAD_TOO_LARGE => Err(ApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!("shard {id} rejected the INSERT body size"),
-        )),
-        status => Err(shard_error(id, format!("INSERT returned {status}"))),
-    }
+    .await
 }
 
 fn metadata_path(replicated: bool) -> &'static str {
@@ -225,6 +269,15 @@ fn physical_entry(
             "expected MergeTree with UInt64 key {}",
             table.key
         )));
+    }
+    if table
+        .schema
+        .as_ref()
+        .is_some_and(|schema| *schema != entry.definition.schema)
+    {
+        return Err(DbError::TypeMismatch(
+            "schema differs from the coordinator configuration".into(),
+        ));
     }
     Ok(entry)
 }

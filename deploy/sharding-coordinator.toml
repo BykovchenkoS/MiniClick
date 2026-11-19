@@ -6,3 +6,10 @@ node_id = "coordinator"
 local_table = "hits_local"
 key = "user_id"
 shards = { "1" = "shard-even:8123", "2" = "shard-odd:8123" }
+
+[sharding.hits.schema]
+columns = [
+  { name = "user_id", data_type = "UInt64" },
+  { name = "category", data_type = "String" },
+  { name = "amount", data_type = "Int64" },
+]

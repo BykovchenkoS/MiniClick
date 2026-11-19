@@ -178,12 +178,17 @@ impl Cluster {
     }
 
     async fn await_rows(&self, node: usize, expected: &str) {
+        self.await_query(node, "SELECT id, value FROM hits ORDER BY id", expected)
+            .await;
+    }
+
+    async fn await_query(&self, node: usize, query: &str, expected: &str) {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let response = self
                 .client
                 .post(self.url(node, "/query"))
-                .body("SELECT id, value FROM hits ORDER BY id")
+                .body(query.to_owned())
                 .send()
                 .await
                 .unwrap();
@@ -306,7 +311,11 @@ async fn coordinator_uses_independent_raft_groups_when_each_shard_elects_a_new_l
     let (even_first, odd_first) = tokio::join!(even.leader(), odd.leader());
     let ddl = "CREATE TABLE hits (id UInt64, value String) ENGINE = MergeTree ORDER BY id";
     even.sql(even_first, ddl).await;
-    odd.sql(odd_first, ddl).await;
+    odd.sql(
+        odd_first,
+        "CREATE TABLE hits (value String, id UInt64) ENGINE = MergeTree ORDER BY id",
+    )
+    .await;
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let coordinator = even.addresses.len();
@@ -314,13 +323,21 @@ async fn coordinator_uses_independent_raft_groups_when_each_shard_elects_a_new_l
         .push(listener.local_addr().unwrap().to_string());
     even.processes.push(None);
     let config = format!(
-        "listen_addr = '{}'\ndata_dir = '{}'\n[sharding.hits]\nlocal_table = 'hits'\nkey = 'id'\nshards = {{ '1' = '{}', '2' = '{}' }}\n[sharding.hits.raft_shards.'1']\ncluster_id = 'even-group'\nmembers = {:?}\n[sharding.hits.raft_shards.'2']\ncluster_id = 'odd-group'\nmembers = {:?}\n",
+        "listen_addr = '{}'\ndata_dir = '{}'\n[sharding.hits]\nlocal_table = 'hits'\nkey = 'id'\nshards = {{ '1' = '{}', '2' = '{}' }}\n[sharding.hits.schema]\ncolumns = [{{ name = 'id', data_type = 'UInt64' }}, {{ name = 'value', data_type = 'String' }}]\n[sharding.hits.raft_shards.'1']\ncluster_id = 'even-group'\nmembers = {:?}\n[sharding.hits.raft_shards.'2']\ncluster_id = 'odd-group'\nmembers = {:?}\n",
         even.addresses[coordinator], even.root.path().join("coordinator").display(),
         even.addresses[even_first], odd.addresses[odd_first], &even.addresses[..3], &odd.addresses,
     );
     std::fs::write(even.config(coordinator), config).unwrap();
     drop(listener);
     even.restart(coordinator).await;
+
+    assert_eq!(
+        even.insert(coordinator, "1,99\n").await,
+        StatusCode::BAD_GATEWAY
+    );
+    assert_eq!(odd.sql(odd_first, "SELECT count() FROM hits").await, "0\n");
+    odd.sql(odd_first, "DROP TABLE hits").await;
+    odd.sql(odd_first, ddl).await;
 
     assert_eq!(
         even.insert(coordinator, "1,odd-before\n").await,
@@ -365,6 +382,35 @@ async fn coordinator_uses_independent_raft_groups_when_each_shard_elects_a_new_l
         odd.sql(odd_second, query).await,
         "1\todd-before\n3\todd-after\n"
     );
+
+    // Первый нечётный лидер всё ещё остановлен. Остановка второго оставляет один голос.
+    odd.kill(odd_second);
+    assert_eq!(
+        even.insert(coordinator, "6,with-odd-down\n").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        even.insert(coordinator, "5,rejected\n7,rejected\n").await,
+        StatusCode::BAD_GATEWAY
+    );
+    assert_eq!(
+        even.insert(coordinator, "8,allowed\n9,mixed\n").await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        even.sql(even_second, query).await,
+        "2\teven-before\n4\teven-after\n6\twith-odd-down\n"
+    );
+    odd.restart(odd_first).await;
+    // Сетевой ping возвращается раньше, чем новый лидер подтвердит чтение кворумом.
+    even.await_query(
+        coordinator,
+        query,
+        "1\todd-before\n2\teven-before\n3\todd-after\n4\teven-after\n6\twith-odd-down\n",
+    )
+    .await;
+    odd.await_rows(odd_first, "1\todd-before\n3\todd-after\n")
+        .await;
 }
 
 #[tokio::test]

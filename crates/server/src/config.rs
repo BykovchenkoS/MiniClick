@@ -7,7 +7,7 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use types::{DbError, Result};
+use types::{DataType, DbError, Result, TableSchema};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -75,6 +75,8 @@ pub struct ClusterConfig {
 pub struct ShardedTableConfig {
     pub local_table: String,
     pub key: String,
+    /// Схема координатора позволяет выбрать шард до обращения к сети.
+    pub schema: Option<TableSchema>,
     #[serde(deserialize_with = "deserialize_addresses")]
     pub shards: BTreeMap<u64, String>,
     #[serde(default, deserialize_with = "deserialize_id_map")]
@@ -271,6 +273,20 @@ impl Config {
                 return Err(DbError::Syntax(format!(
                     "sharding table {name:?} requires nonempty names and shards with positive IDs and distinct addresses"
                 )));
+            }
+            if let Some(schema) = &table.schema {
+                let mut columns = BTreeSet::new();
+                if schema
+                    .columns
+                    .iter()
+                    .any(|column| column.name.trim().is_empty() || !columns.insert(&column.name))
+                    || schema.column(&table.key).map(|column| column.data_type)
+                        != Some(DataType::UInt64)
+                {
+                    return Err(DbError::Syntax(format!(
+                        "sharding table {name:?} requires distinct nonempty column names and a UInt64 shard key"
+                    )));
+                }
             }
             for (id, address) in &table.shards {
                 validate_peer_address(address).map_err(|error| {

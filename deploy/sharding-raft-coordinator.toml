@@ -7,6 +7,13 @@ local_table = "hits_local"
 key = "user_id"
 shards = { "1" = "shard-even-1:8123", "2" = "shard-odd:8123" }
 
+[sharding.hits.schema]
+columns = [
+  { name = "user_id", data_type = "UInt64" },
+  { name = "category", data_type = "String" },
+  { name = "amount", data_type = "Int64" },
+]
+
 [sharding.hits.raft_shards."1"]
 cluster_id = "sharding-raft-even"
 members = ["shard-even-1:8123", "shard-even-2:8123", "shard-even-3:8123"]

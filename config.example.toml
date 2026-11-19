@@ -21,6 +21,12 @@ max_body_bytes = 268435456
 # local_table = "hits_local"
 # key = "user_id"
 # shards = { "1" = "shard1:8123", "2" = "shard2:8123" }
+# [sharding.hits.schema]
+# columns = [
+#   { name = "user_id", data_type = "UInt64" },
+#   { name = "category", data_type = "String" },
+#   { name = "amount", data_type = "Int64" },
+# ]
 
 # На первом физическом шарде укажите тот же ключ и все ID из карты координатора.
 # [local_shards.hits_local]

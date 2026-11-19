@@ -207,6 +207,30 @@ fn sharding_rejects_invalid_tables_and_ambiguous_destinations() {
 }
 
 #[test]
+fn coordinator_schema_requires_unique_columns_and_a_uint64_shard_key() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("config.toml");
+    let schema = "\n[sharding.Hits.schema]\ncolumns = [{ name = 'user_id', data_type = 'UInt64' }, { name = 'label', data_type = 'String' }]\n";
+    std::fs::write(&path, format!("{SHARDING_CONFIG}{schema}")).unwrap();
+    let config = Config::load(cli(&[]), root.path()).unwrap();
+    assert_eq!(
+        config.sharding["Hits"].schema.as_ref().unwrap().names(),
+        ["user_id", "label"]
+    );
+    for invalid in [
+        schema.replace("'UInt64'", "'Int64'"),
+        schema.replace("'user_id'", "'other_id'"),
+        schema.replace("'label'", "'user_id'"),
+    ] {
+        std::fs::write(&path, format!("{SHARDING_CONFIG}{invalid}")).unwrap();
+        assert!(matches!(
+            Config::load(cli(&[]), root.path()),
+            Err(types::DbError::Syntax(_))
+        ));
+    }
+}
+
+#[test]
 fn raft_shards_require_distinct_cluster_ids_and_member_addresses() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("config.toml");
