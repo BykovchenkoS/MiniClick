@@ -54,6 +54,8 @@ struct FileConfig {
     sync_interval_ms: Option<u64>,
     max_body_bytes: Option<usize>,
     cluster: Option<ClusterConfig>,
+    #[serde(default)]
+    sharding: BTreeMap<String, ShardedTableConfig>,
 }
 
 /// Фиксированный состав Raft; DNS разрешается только при сетевом соединении.
@@ -61,11 +63,37 @@ struct FileConfig {
 #[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
     pub id: u64,
-    #[serde(deserialize_with = "deserialize_members")]
+    #[serde(deserialize_with = "deserialize_addresses")]
     pub members: BTreeMap<u64, String>,
 }
 
-fn deserialize_members<'de, D: serde::Deserializer<'de>>(
+/// Размещение одной логической таблицы на независимых узлах.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShardedTableConfig {
+    pub local_table: String,
+    pub key: String,
+    #[serde(deserialize_with = "deserialize_addresses")]
+    pub shards: BTreeMap<u64, String>,
+}
+
+impl ShardedTableConfig {
+    /// Ключ UInt64 задаёт индекс в порядке возрастания ID шардов.
+    pub fn shard_for_key(&self, key: u64) -> Option<(u64, &str)> {
+        let index = self.shard_index(key)?;
+        self.shards
+            .iter()
+            .nth(index)
+            .map(|(&id, address)| (id, address.as_str()))
+    }
+
+    pub(crate) fn shard_index(&self, key: u64) -> Option<usize> {
+        key.checked_rem(self.shards.len() as u64)
+            .map(|index| index as usize)
+    }
+}
+
+fn deserialize_addresses<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<BTreeMap<u64, String>, D::Error> {
     let members = BTreeMap::<String, String>::deserialize(deserializer)?;
@@ -74,7 +102,7 @@ fn deserialize_members<'de, D: serde::Deserializer<'de>>(
         .map(|(key, address)| {
             let id = key.parse::<u64>().map_err(serde::de::Error::custom)?;
             if id.to_string() != key {
-                return Err(serde::de::Error::custom("member id must be canonical"));
+                return Err(serde::de::Error::custom("id must be canonical"));
             }
             Ok((id, address))
         })
@@ -87,6 +115,8 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub max_body_bytes: usize,
     pub cluster: Option<ClusterConfig>,
+    /// Карта логических таблиц по регистрозависимым именам.
+    pub sharding: BTreeMap<String, ShardedTableConfig>,
 }
 
 impl Default for Config {
@@ -102,6 +132,7 @@ impl Default for Config {
             data_dir: PathBuf::from("./data"),
             max_body_bytes: 256 * 1024 * 1024,
             cluster: None,
+            sharding: BTreeMap::new(),
         }
     }
 }
@@ -120,6 +151,7 @@ impl Config {
         };
         let mut config = Self {
             cluster: file.cluster,
+            sharding: file.sharding,
             ..Self::default()
         };
         if let Some(addr) = cli.listen_addr.or(file.listen_addr) {
@@ -154,6 +186,31 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if !self.sharding.is_empty()
+            && (self.cluster.is_some() || matches!(self.node.role, Role::Replica { .. }))
+        {
+            return Err(DbError::Unsupported(
+                "sharding coordinator requires a standalone leader".into(),
+            ));
+        }
+        for (name, table) in &self.sharding {
+            if name.trim().is_empty()
+                || table.local_table.trim().is_empty()
+                || table.key.trim().is_empty()
+                || table.shards.is_empty()
+                || table.shards.contains_key(&0)
+                || table.shards.values().collect::<BTreeSet<_>>().len() != table.shards.len()
+            {
+                return Err(DbError::Syntax(format!(
+                    "sharding table {name:?} requires nonempty names and shards with positive IDs and distinct addresses"
+                )));
+            }
+            for (id, address) in &table.shards {
+                validate_peer_address(address).map_err(|error| {
+                    DbError::Syntax(format!("sharding table {name:?}, shard {id}: {error}"))
+                })?;
+            }
+        }
         if let Some(cluster) = &self.cluster {
             if cluster.members.len() != 3
                 || !cluster.members.contains_key(&cluster.id)

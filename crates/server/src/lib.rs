@@ -43,6 +43,11 @@ impl AppState {
     /// Только сервер знает одновременно о постоянном Catalog, Query и Storage.
     pub fn open(config: Config) -> Result<Self> {
         config.validate()?;
+        if !config.sharding.is_empty() {
+            return Err(DbError::Unsupported(
+                "sharding routing is not available yet".into(),
+            ));
+        }
         let (directory, lease) = if config.cluster.is_some() {
             let (path, lease) = cluster::prepare_view(&config)?;
             (path, Some(lease))

@@ -12,6 +12,7 @@ fn defaults_and_cli_override_toml_without_resetting_other_fields() {
     assert_eq!(defaults.node.listen_addr, "127.0.0.1:8123");
     assert_eq!(defaults.data_dir, root.path().join("./data"));
     assert_eq!(defaults.max_body_bytes, 256 * 1024 * 1024);
+    assert!(defaults.sharding.is_empty());
     std::fs::write(root.path().join("config.toml"), "listen_addr = '127.0.0.1:9000'\ndata_dir = 'saved'\nnode_id = 'from-file'\nmax_body_bytes = 100\nrole = 'Leader'\n").unwrap();
     let config = Config::load(
         cli(&[
@@ -151,5 +152,71 @@ fn cluster_config_rejects_ambiguous_members_and_static_replica_role() {
     ] {
         std::fs::write(root.path().join("config.toml"), configuration).unwrap();
         assert!(Config::load(cli(&[]), root.path()).is_err(), "{configuration}");
+    }
+}
+
+const SHARDING_CONFIG: &str = r#"
+[sharding.Hits]
+local_table = "hits_local"
+key = "user_id"
+shards = { "10" = "shard10:8123", "7" = "[::1]:8123", "2" = "shard2:8123" }
+"#;
+
+#[test]
+fn sharding_routes_full_width_keys_by_numeric_shard_id() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("config.toml"), SHARDING_CONFIG).unwrap();
+    let config = Config::load(cli(&[]), root.path()).unwrap();
+    let table = &config.sharding["Hits"];
+    assert!(!config.sharding.contains_key("hits"));
+    assert_eq!(table.local_table, "hits_local");
+    assert_eq!(table.key, "user_id");
+    assert_eq!(table.shard_for_key(0), Some((2, "shard2:8123")));
+    assert_eq!(table.shard_for_key(1 << 32), Some((7, "[::1]:8123")));
+    assert_eq!(table.shard_for_key(5), Some((10, "shard10:8123")));
+    assert_eq!(table.shard_for_key(u64::MAX), Some((2, "shard2:8123")));
+}
+
+#[test]
+fn sharding_rejects_invalid_tables_and_ambiguous_destinations() {
+    let root = tempfile::tempdir().unwrap();
+    for (original, replacement) in [
+        ("sharding.Hits", "sharding.\"\""),
+        ("hits_local", ""),
+        ("user_id", ""),
+        (
+            r#"{ "10" = "shard10:8123", "7" = "[::1]:8123", "2" = "shard2:8123" }"#,
+            "{}",
+        ),
+        (r#""7" ="#, r#""0" ="#),
+        (r#""7" ="#, r#""07" ="#),
+        (r#""7" ="#, r#""10" ="#),
+        ("shard10:8123", "shard2:8123"),
+        ("shard10:8123", "shard10"),
+    ] {
+        let config = SHARDING_CONFIG.replace(original, replacement);
+        std::fs::write(root.path().join("config.toml"), &config).unwrap();
+        assert!(
+            matches!(
+                Config::load(cli(&[]), root.path()),
+                Err(types::DbError::Syntax(_))
+            ),
+            "{config}"
+        );
+    }
+}
+
+#[test]
+fn sharding_coordinator_requires_a_standalone_leader() {
+    let root = tempfile::tempdir().unwrap();
+    for configuration in [
+        format!("role = 'Replica'\nleader_addr = 'node1:8123'\nleader_id = 'node1'\n{SHARDING_CONFIG}"),
+        format!("{SHARDING_CONFIG}\n[cluster]\nid = 1\nmembers = {{ '1' = 'node1:8123', '2' = 'node2:8123', '3' = 'node3:8123' }}"),
+    ] {
+        std::fs::write(root.path().join("config.toml"), configuration).unwrap();
+        assert!(matches!(
+            Config::load(cli(&[]), root.path()),
+            Err(types::DbError::Unsupported(_))
+        ));
     }
 }
