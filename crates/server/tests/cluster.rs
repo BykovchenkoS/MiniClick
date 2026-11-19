@@ -26,10 +26,10 @@ impl Cluster {
     }
 
     async fn start_with_limit(limit: usize) -> Self {
-        Self::start_with_config(limit, "").await
+        Self::start_with_config(limit, "process-test", "").await
     }
 
-    async fn start_with_config(limit: usize, placement: &str) -> Self {
+    async fn start_with_config(limit: usize, cluster_id: &str, placement: &str) -> Self {
         let listeners: Vec<_> = (0..3)
             .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
             .collect();
@@ -48,7 +48,7 @@ impl Cluster {
         };
         drop(listeners);
         for node in 0..3 {
-            let config = format!("max_body_bytes = {limit}\nlisten_addr = '{}'\ndata_dir = '{}'\ncluster_id = 'process-test'\nnode_id = 'node{}'\n[cluster]\nid = {}\nmembers = {{ '1' = '{}', '2' = '{}', '3' = '{}' }}\n{placement}", cluster.addresses[node], cluster.root.path().join(format!("data{node}")).display(), node+1, node+1, cluster.addresses[0], cluster.addresses[1], cluster.addresses[2]);
+            let config = format!("max_body_bytes = {limit}\nlisten_addr = '{}'\ndata_dir = '{}'\ncluster_id = '{cluster_id}'\nnode_id = 'node{}'\n[cluster]\nid = {}\nmembers = {{ '1' = '{}', '2' = '{}', '3' = '{}' }}\n{placement}", cluster.addresses[node], cluster.root.path().join(format!("data{node}")).display(), node+1, node+1, cluster.addresses[0], cluster.addresses[1], cluster.addresses[2]);
             std::fs::write(cluster.config(node), config).unwrap();
             cluster.restart(node).await;
         }
@@ -207,6 +207,7 @@ impl Cluster {
 async fn coordinator_reads_committed_shard_rows_and_inserts_after_raft_leader_failure() {
     let mut cluster = Cluster::start_with_config(
         256 * 1024 * 1024,
+        "process-test",
         "\n[local_shards.hits]\nkey = 'id'\nshard_id = 1\nshard_ids = [1, 2]\n",
     )
     .await;
@@ -277,6 +278,93 @@ async fn coordinator_reads_committed_shard_rows_and_inserts_after_raft_leader_fa
 
     cluster.restart(first).await;
     cluster.await_rows(first, "2\tbefore\n4\tafter\n").await;
+}
+
+#[tokio::test]
+async fn coordinator_uses_independent_raft_groups_when_each_shard_elects_a_new_leader() {
+    let (mut even, mut odd) = tokio::join!(
+        Cluster::start_with_config(
+            256 * 1024 * 1024,
+            "even-group",
+            "\n[local_shards.hits]\nkey = 'id'\nshard_id = 1\nshard_ids = [1, 2]\n",
+        ),
+        Cluster::start_with_config(
+            256 * 1024 * 1024,
+            "odd-group",
+            "\n[local_shards.hits]\nkey = 'id'\nshard_id = 2\nshard_ids = [1, 2]\n",
+        )
+    );
+    for group in [&even, &odd] {
+        let response = group
+            .client
+            .post(group.url(0, "/cluster/init"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let (even_first, odd_first) = tokio::join!(even.leader(), odd.leader());
+    let ddl = "CREATE TABLE hits (id UInt64, value String) ENGINE = MergeTree ORDER BY id";
+    even.sql(even_first, ddl).await;
+    odd.sql(odd_first, ddl).await;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let coordinator = even.addresses.len();
+    even.addresses
+        .push(listener.local_addr().unwrap().to_string());
+    even.processes.push(None);
+    let config = format!(
+        "listen_addr = '{}'\ndata_dir = '{}'\n[sharding.hits]\nlocal_table = 'hits'\nkey = 'id'\nshards = {{ '1' = '{}', '2' = '{}' }}\n[sharding.hits.raft_shards.'1']\ncluster_id = 'even-group'\nmembers = {:?}\n[sharding.hits.raft_shards.'2']\ncluster_id = 'odd-group'\nmembers = {:?}\n",
+        even.addresses[coordinator], even.root.path().join("coordinator").display(),
+        even.addresses[even_first], odd.addresses[odd_first], &even.addresses[..3], &odd.addresses,
+    );
+    std::fs::write(even.config(coordinator), config).unwrap();
+    drop(listener);
+    even.restart(coordinator).await;
+
+    assert_eq!(
+        even.insert(coordinator, "1,odd-before\n").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        even.insert(coordinator, "2,even-before\n").await,
+        StatusCode::OK
+    );
+    let even_term = even.status(even_first).await["term"].clone();
+    let query = "SELECT id, value FROM hits ORDER BY id";
+    odd.kill(odd_first);
+    assert_ne!(odd.leader().await, odd_first);
+    let even_status = even.status(even_first).await;
+    assert_eq!(even_status["role"], "Leader");
+    assert_eq!(even_status["term"], even_term);
+    assert_eq!(
+        even.sql(coordinator, query).await,
+        "1\todd-before\n2\teven-before\n"
+    );
+    assert_eq!(
+        even.insert(coordinator, "3,odd-after\n").await,
+        StatusCode::OK
+    );
+
+    even.kill(even_first);
+    let (even_second, odd_second) = tokio::join!(even.leader(), odd.leader());
+    assert_ne!(even_second, even_first);
+    assert_eq!(
+        even.insert(coordinator, "4,even-after\n").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        even.sql(coordinator, query).await,
+        "1\todd-before\n2\teven-before\n3\todd-after\n4\teven-after\n"
+    );
+    assert_eq!(
+        even.sql(even_second, query).await,
+        "2\teven-before\n4\teven-after\n"
+    );
+    assert_eq!(
+        odd.sql(odd_second, query).await,
+        "1\todd-before\n3\todd-after\n"
+    );
 }
 
 #[tokio::test]

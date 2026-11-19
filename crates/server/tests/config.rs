@@ -207,6 +207,30 @@ fn sharding_rejects_invalid_tables_and_ambiguous_destinations() {
 }
 
 #[test]
+fn raft_shards_require_distinct_cluster_ids_and_member_addresses() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("config.toml");
+    let config = format!("{SHARDING_CONFIG}\n[sharding.Hits.raft_shards.'2']\ncluster_id = 'even'\nmembers = ['shard2:8123', 'even2:8123', 'even3:8123']\n[sharding.Hits.raft_shards.'10']\ncluster_id = 'odd'\nmembers = ['shard10:8123', 'odd2:8123', 'odd3:8123']");
+    std::fs::write(&path, &config).unwrap();
+    let loaded = Config::load(cli(&[]), root.path()).unwrap();
+    assert_eq!(loaded.sharding["Hits"].raft_shards[&10].cluster_id, "odd");
+    for (original, replacement) in [
+        ("cluster_id = 'odd'", "cluster_id = 'even'"),
+        ("odd2:8123", "even2:8123"),
+        ("odd2:8123", "[::1]:8123"),
+    ] {
+        std::fs::write(&path, config.replace(original, replacement)).unwrap();
+        assert!(
+            matches!(
+                Config::load(cli(&[]), root.path()),
+                Err(types::DbError::Syntax(_))
+            ),
+            "{replacement}"
+        );
+    }
+}
+
+#[test]
 fn sharding_coordinator_requires_a_standalone_leader() {
     let root = tempfile::tempdir().unwrap();
     for configuration in [

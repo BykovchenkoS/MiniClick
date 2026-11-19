@@ -1,0 +1,13 @@
+listen_addr = "0.0.0.0:8123"
+data_dir = "/data"
+cluster_id = "sharding-raft-odd"
+node_id = "shard-odd-2"
+
+[cluster]
+id = 2
+members = { "1" = "shard-odd:8123", "2" = "shard-odd-2:8123", "3" = "shard-odd-3:8123" }
+
+[local_shards.hits_local]
+key = "user_id"
+shard_id = 2
+shard_ids = [1, 2]

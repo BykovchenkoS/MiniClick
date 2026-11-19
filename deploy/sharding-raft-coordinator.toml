@@ -10,3 +10,7 @@ shards = { "1" = "shard-even-1:8123", "2" = "shard-odd:8123" }
 [sharding.hits.raft_shards."1"]
 cluster_id = "sharding-raft-even"
 members = ["shard-even-1:8123", "shard-even-2:8123", "shard-even-3:8123"]
+
+[sharding.hits.raft_shards."2"]
+cluster_id = "sharding-raft-odd"
+members = ["shard-odd:8123", "shard-odd-2:8123", "shard-odd-3:8123"]

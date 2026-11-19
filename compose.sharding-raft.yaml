@@ -51,12 +51,30 @@ services:
     ports:
       - "127.0.0.1:8144:8123"
     volumes:
-      - ./deploy/sharding-odd.toml:/app/node.toml:ro
-      - shard-odd-data:/data
+      - ./deploy/sharding-raft-odd-1.toml:/app/node.toml:ro
+      - shard-odd-1-data:/data
+
+  shard-odd-2:
+    <<: *node
+    ports:
+      - "127.0.0.1:8145:8123"
+    volumes:
+      - ./deploy/sharding-raft-odd-2.toml:/app/node.toml:ro
+      - shard-odd-2-data:/data
+
+  shard-odd-3:
+    <<: *node
+    ports:
+      - "127.0.0.1:8146:8123"
+    volumes:
+      - ./deploy/sharding-raft-odd-3.toml:/app/node.toml:ro
+      - shard-odd-3-data:/data
 
 volumes:
   coordinator-data:
   shard-even-1-data:
   shard-even-2-data:
   shard-even-3-data:
-  shard-odd-data:
+  shard-odd-1-data:
+  shard-odd-2-data:
+  shard-odd-3-data:

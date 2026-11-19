@@ -277,6 +277,8 @@ impl Config {
                     DbError::Syntax(format!("sharding table {name:?}, shard {id}: {error}"))
                 })?;
             }
+            let mut cluster_ids = BTreeSet::new();
+            let mut addresses: BTreeSet<_> = table.shards.values().collect();
             for (id, group) in &table.raft_shards {
                 if group.cluster_id.trim().is_empty()
                     || group.members.len() != 3
@@ -290,8 +292,18 @@ impl Config {
                         "sharding table {name:?}, shard {id}: Raft requires a cluster ID and three distinct members including the configured shard address"
                     )));
                 }
+                if !cluster_ids.insert(&group.cluster_id) {
+                    return Err(DbError::Syntax(format!(
+                        "sharding table {name:?}, shard {id}: Raft cluster ID is already used by another shard"
+                    )));
+                }
                 for address in &group.members {
                     validate_peer_address(address)?;
+                    if table.shards.get(id) != Some(address) && !addresses.insert(address) {
+                        return Err(DbError::Syntax(format!(
+                            "sharding table {name:?}, shard {id}: Raft address {address} is already used by another shard"
+                        )));
+                    }
                 }
             }
         }
