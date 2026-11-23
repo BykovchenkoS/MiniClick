@@ -17,7 +17,7 @@ services:
   coordinator:
     <<: *node
     ports:
-      - "127.0.0.1:8140:8123"
+      - "127.0.0.1:${MINICLICK_RAFT_COORDINATOR_PORT:-8140}:8123"
     volumes:
       - ./deploy/sharding-raft-coordinator.toml:/app/node.toml:ro
       - coordinator-data:/data
@@ -25,7 +25,7 @@ services:
   shard-even-1:
     <<: *node
     ports:
-      - "127.0.0.1:8141:8123"
+      - "127.0.0.1:${MINICLICK_RAFT_EVEN_1_PORT:-8141}:8123"
     volumes:
       - ./deploy/sharding-raft-even-1.toml:/app/node.toml:ro
       - shard-even-1-data:/data
@@ -33,7 +33,7 @@ services:
   shard-even-2:
     <<: *node
     ports:
-      - "127.0.0.1:8142:8123"
+      - "127.0.0.1:${MINICLICK_RAFT_EVEN_2_PORT:-8142}:8123"
     volumes:
       - ./deploy/sharding-raft-even-2.toml:/app/node.toml:ro
       - shard-even-2-data:/data
@@ -41,7 +41,7 @@ services:
   shard-even-3:
     <<: *node
     ports:
-      - "127.0.0.1:8143:8123"
+      - "127.0.0.1:${MINICLICK_RAFT_EVEN_3_PORT:-8143}:8123"
     volumes:
       - ./deploy/sharding-raft-even-3.toml:/app/node.toml:ro
       - shard-even-3-data:/data
@@ -49,7 +49,7 @@ services:
   shard-odd:
     <<: *node
     ports:
-      - "127.0.0.1:8144:8123"
+      - "127.0.0.1:${MINICLICK_RAFT_ODD_1_PORT:-8144}:8123"
     volumes:
       - ./deploy/sharding-raft-odd-1.toml:/app/node.toml:ro
       - shard-odd-1-data:/data
@@ -57,7 +57,7 @@ services:
   shard-odd-2:
     <<: *node
     ports:
-      - "127.0.0.1:8145:8123"
+      - "127.0.0.1:${MINICLICK_RAFT_ODD_2_PORT:-8145}:8123"
     volumes:
       - ./deploy/sharding-raft-odd-2.toml:/app/node.toml:ro
       - shard-odd-2-data:/data
@@ -65,7 +65,7 @@ services:
   shard-odd-3:
     <<: *node
     ports:
-      - "127.0.0.1:8146:8123"
+      - "127.0.0.1:${MINICLICK_RAFT_ODD_3_PORT:-8146}:8123"
     volumes:
       - ./deploy/sharding-raft-odd-3.toml:/app/node.toml:ro
       - shard-odd-3-data:/data
