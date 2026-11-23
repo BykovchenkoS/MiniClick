@@ -39,6 +39,13 @@ pub struct ScanStats {
     pub rows_selected: u64,
 }
 
+/// Статистика чтения и, для распределённой таблицы, ID выбранных шардов.
+pub struct ScanExplanation {
+    pub stats: ScanStats,
+    /// `None` у локальной таблицы, пустой список при отсечении всех шардов.
+    pub selected_shards: Option<Vec<u64>>,
+}
+
 /// Таблица. Реализации: MemTable (types::testing) и MergeTree (storage).
 /// Все методы берут &self: одну таблицу читают и пишут из нескольких потоков.
 pub trait Table: Send + Sync {
@@ -54,6 +61,14 @@ pub trait Table: Send + Sync {
     /// Должен использовать то же отсечение, что и scan, чтобы EXPLAIN не расходился
     /// с реальным чтением.
     fn explain_scan(&self, request: &ScanRequest) -> Result<ScanStats>;
+
+    /// Возвращает детали плана без чтения данных колонок.
+    fn explain_scan_details(&self, request: &ScanRequest) -> Result<ScanExplanation> {
+        Ok(ScanExplanation {
+            stats: self.explain_scan(request)?,
+            selected_shards: None,
+        })
+    }
 
     /// Сбросить буферы на диск. Если буферов нет — ничего не делать.
     fn flush(&self) -> Result<()>;

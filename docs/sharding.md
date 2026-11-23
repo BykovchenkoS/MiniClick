@@ -93,9 +93,10 @@ blog    56    2
 EXPLAIN SELECT user_id, category, amount FROM hits WHERE user_id = 4
 ```
 
-Последняя строка плана содержит статистику чётного шарда.
+В конце плана указаны ID выбранных шардов и статистика чтения.
 
 ```text
+shards: [1]
 parts: 1 / 1, granules: 2 / 3, rows: 2 / 3 (selected / total; before WHERE)
 ```
 

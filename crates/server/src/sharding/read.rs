@@ -26,8 +26,8 @@ use std::{
     time::Duration,
 };
 use types::{
-    Block, BlockStream, Catalog, ColumnDef, DbError, Engine, Result, ScanRequest, ScanStats, Table,
-    TableDefinition, TableEntry, TableId, TableSchema,
+    Block, BlockStream, Catalog, ColumnDef, DbError, Engine, Result, ScanExplanation, ScanRequest,
+    ScanStats, Table, TableDefinition, TableEntry, TableId, TableSchema,
 };
 use wire::{Frame, Predicate, ReadRequest};
 
@@ -280,9 +280,15 @@ impl Table for ShardedTable {
     }
 
     fn explain_scan(&self, request: &ScanRequest) -> Result<ScanStats> {
+        Ok(self.explain_scan_details(request)?.stats)
+    }
+
+    fn explain_scan_details(&self, request: &ScanRequest) -> Result<ScanExplanation> {
         let request = ReadRequest::from(request);
         let mut total = ScanStats::default();
-        for shard in self.selected_shards(request.predicate.as_ref()) {
+        let shards = self.selected_shards(request.predicate.as_ref());
+        let selected_shards = shards.iter().map(|shard| shard.id).collect();
+        for shard in shards {
             let shard = shard.resolve(&self.client, &self.config, &self.definition.schema)?;
             let stats: ScanInfo = Self::request(&self.client, &shard, "stats", &request)?
                 .json()
@@ -302,7 +308,10 @@ impl Table for ShardedTable {
                 rows_selected
             );
         }
-        Ok(total)
+        Ok(ScanExplanation {
+            stats: total,
+            selected_shards: Some(selected_shards),
+        })
     }
 
     fn insert(&self, _: Block) -> Result<()> {

@@ -96,7 +96,16 @@ pub(crate) fn execute(plan: &QueryPlan) -> Result<QueryOutput> {
                 .join(", ")
         ));
         // Статистика отсечения: scan не вызывается.
-        let stats = plan.table.explain_scan(&plan.scan)?;
+        let details = plan.table.explain_scan_details(&plan.scan)?;
+        if let Some(shards) = details.selected_shards {
+            let ids = shards
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            nodes.push(format!("shards: [{ids}]"));
+        }
+        let stats = details.stats;
         nodes.push(format!(
             "parts: {} / {}, granules: {} / {}, rows: {} / {} (selected / total; before WHERE)",
             stats.parts_selected,

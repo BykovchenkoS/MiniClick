@@ -282,6 +282,7 @@ async fn sharded_select_groups_and_sorts_globally_and_fails_on_a_late_shard_erro
     )
     .unwrap();
     let explain = sql(&client, &coordinator, &format!("EXPLAIN {grouped}")).await;
+    assert!(explain.lines().any(|line| line.trim() == "shards: [2, 10]"));
     assert!(explain.contains("parts: 2 / 2, granules: 5 / 6, rows: 5 / 6"));
     let response = client
         .post(format!("{}/query", coordinator.url))
@@ -374,10 +375,18 @@ async fn sharded_select_skips_unneeded_shards_and_damaged_granules() {
         "SELECT label FROM hits WHERE (4 = id OR id = 2) AND NOT (label = 'no') ORDER BY id";
     assert_eq!(sql(&client, &coordinator, query).await, "hit\n");
     let explain = sql(&client, &coordinator, &format!("EXPLAIN {query}")).await;
+    assert!(explain.lines().any(|line| line.trim() == "shards: [2]"));
     assert!(
         explain.contains("parts: 1 / 1, granules: 2 / 3, rows: 2 / 3"),
         "{explain}"
     );
+    let empty = sql(
+        &client,
+        &coordinator,
+        "EXPLAIN SELECT count() FROM hits WHERE id = 2 AND id = 3",
+    )
+    .await;
+    assert!(empty.lines().any(|line| line.trim() == "shards: []"));
 }
 
 #[tokio::test]
