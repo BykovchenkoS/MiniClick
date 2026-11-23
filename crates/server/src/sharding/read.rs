@@ -40,8 +40,18 @@ impl ShardedCatalog {
     pub(crate) fn new(
         local: Arc<dyn Catalog>,
         tables: BTreeMap<String, ShardedTableConfig>,
-    ) -> Self {
-        Self { local, tables }
+    ) -> Result<Self> {
+        if let Some(definition) = local
+            .list_tables()
+            .into_iter()
+            .find(|definition| tables.contains_key(&definition.name))
+        {
+            return Err(DbError::Syntax(format!(
+                "sharding table {:?} conflicts with an existing local table",
+                definition.name
+            )));
+        }
+        Ok(Self { local, tables })
     }
 }
 
@@ -68,6 +78,7 @@ impl Catalog for ShardedCatalog {
     }
 
     fn list_tables(&self) -> Vec<TableDefinition> {
+        // Точный список логических таблиц может требовать сетевого запроса и вернуть ошибку.
         self.local.list_tables()
     }
 }
@@ -76,7 +87,7 @@ fn sharded_ddl() -> DbError {
     DbError::Unsupported("DDL for sharded tables".into())
 }
 
-struct ShardedTable {
+pub(crate) struct ShardedTable {
     definition: TableDefinition,
     endpoints: Vec<Shard>,
     config: ShardedTableConfig,
@@ -146,7 +157,7 @@ fn leader(client: &Client, group: &RaftShardConfig) -> Result<Url> {
 }
 
 impl ShardedTable {
-    fn open(name: &str, config: &ShardedTableConfig) -> Result<Self> {
+    pub(crate) fn open(name: &str, config: &ShardedTableConfig) -> Result<Self> {
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))

@@ -69,7 +69,7 @@ impl AppState {
             Arc::new(sharding::read::ShardedCatalog::new(
                 catalog.clone(),
                 config.sharding.clone(),
-            ))
+            )?)
         };
         let query = Arc::new(::query::SqlQueryEngine::new(query_catalog));
         Ok(Self {

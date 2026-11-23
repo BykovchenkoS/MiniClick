@@ -2,12 +2,13 @@
 
 use crate::{
     error::{blocking, ApiError, ErrorResponse},
+    sharding::read::ShardedTable,
     AppState,
 };
 use axum::extract::{rejection::PathRejection, Path, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use types::{Codec, DbError, Engine, ScanRequest, ScanStats, TableDefinition};
+use types::{Codec, DbError, Engine, ScanRequest, ScanStats, Table, TableDefinition, TableSchema};
 use utoipa::ToSchema;
 
 #[derive(Serialize, ToSchema)]
@@ -19,6 +20,20 @@ pub struct ColumnInfo {
 pub struct SchemaInfo {
     pub columns: Vec<ColumnInfo>,
 }
+impl From<TableSchema> for SchemaInfo {
+    fn from(schema: TableSchema) -> Self {
+        Self {
+            columns: schema
+                .columns
+                .into_iter()
+                .map(|column| ColumnInfo {
+                    name: column.name,
+                    data_type: column.data_type.to_string(),
+                })
+                .collect(),
+        }
+    }
+}
 #[derive(Serialize, ToSchema)]
 pub struct SettingsInfo {
     pub index_granularity: usize,
@@ -29,31 +44,36 @@ pub struct TableInfo {
     pub name: String,
     pub schema: SchemaInfo,
     pub engine: String,
-    pub order_by: Vec<String>,
-    pub settings: SettingsInfo,
+    /// Ключ сортировки локальной таблицы.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order_by: Option<Vec<String>>,
+    /// Параметры хранения локальной таблицы.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings: Option<SettingsInfo>,
+}
+impl TableInfo {
+    fn distributed(name: String, schema: TableSchema) -> Self {
+        Self {
+            name,
+            schema: schema.into(),
+            engine: "Distributed".into(),
+            order_by: None,
+            settings: None,
+        }
+    }
 }
 impl From<TableDefinition> for TableInfo {
     fn from(definition: TableDefinition) -> Self {
         Self {
             name: definition.name,
-            schema: SchemaInfo {
-                columns: definition
-                    .schema
-                    .columns
-                    .into_iter()
-                    .map(|column| ColumnInfo {
-                        name: column.name,
-                        data_type: column.data_type.to_string(),
-                    })
-                    .collect(),
-            },
+            schema: definition.schema.into(),
             engine: match definition.engine {
                 Engine::Memory => "Memory",
                 Engine::MergeTree => "MergeTree",
             }
             .into(),
-            order_by: definition.order_by,
-            settings: SettingsInfo {
+            order_by: Some(definition.order_by),
+            settings: Some(SettingsInfo {
                 index_granularity: definition.settings.index_granularity,
                 codec: match definition.settings.codec {
                     Codec::None => "None",
@@ -61,7 +81,7 @@ impl From<TableDefinition> for TableInfo {
                     Codec::Zstd => "ZSTD",
                 }
                 .into(),
-            },
+            }),
         }
     }
 }
@@ -95,8 +115,8 @@ pub struct TableDescription {
 }
 
 #[utoipa::path(get, path = "/tables", tag = "metadata", responses(
-    (status = 200, description = "Таблицы по имени", body = [TableInfo]),
-    (status = 500, description = "Ошибка сервера", body = ErrorResponse)
+    (status = 200, description = "Локальные и логические таблицы по имени", body = [TableInfo]),
+    (status = 500, description = "Ошибка сервера или не удалось получить схему логической таблицы", body = ErrorResponse)
 ))]
 pub async fn tables(State(app): State<AppState>) -> Result<Json<Vec<TableInfo>>, ApiError> {
     blocking(move || {
@@ -105,22 +125,33 @@ pub async fn tables(State(app): State<AppState>) -> Result<Json<Vec<TableInfo>>,
             .read()
             .map_err(|_| DbError::Internal("view lock poisoned".into()))?;
         app.check_view()?;
-        Ok(Json(
-            app.catalog
-                .list_tables()
-                .into_iter()
-                .map(TableInfo::from)
-                .collect(),
-        ))
+        let mut tables: Vec<_> = app
+            .catalog
+            .list_tables()
+            .into_iter()
+            .map(TableInfo::from)
+            .collect();
+        for (name, config) in &app.config.sharding {
+            let schema = match &config.schema {
+                Some(schema) => schema.clone(),
+                None => ShardedTable::open(name, config)?
+                    .definition()
+                    .schema
+                    .clone(),
+            };
+            tables.push(TableInfo::distributed(name.clone(), schema));
+        }
+        tables.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        Ok(Json(tables))
     })
     .await
 }
 
 #[utoipa::path(get, path = "/tables/{name}", tag = "metadata", params(("name" = String, Path, description = "Регистрозависимое имя таблицы")), responses(
-    (status = 200, description = "Описание и статистика таблицы", body = TableDescription),
+    (status = 200, description = "Описание и статистика полного скана, суммарная для всех шардов логической таблицы", body = TableDescription),
     (status = 400, description = "Неверное имя", body = ErrorResponse),
     (status = 404, description = "Таблица не найдена", body = ErrorResponse),
-    (status = 500, description = "Ошибка сервера", body = ErrorResponse)
+    (status = 500, description = "Ошибка сервера или не удалось получить данные требуемого шарда", body = ErrorResponse)
 ))]
 pub async fn describe(
     State(app): State<AppState>,
@@ -133,6 +164,13 @@ pub async fn describe(
             .read()
             .map_err(|_| DbError::Internal("view lock poisoned".into()))?;
         app.check_view()?;
+        if let Some(config) = app.config.sharding.get(&name) {
+            let table = ShardedTable::open(&name, config)?;
+            return Ok(Json(TableDescription {
+                definition: TableInfo::distributed(name, table.definition().schema.clone()),
+                stats: table.explain_scan(&ScanRequest::default())?.into(),
+            }));
+        }
         let table = app.catalog.get_table(&name)?;
         Ok(Json(TableDescription {
             definition: table.definition().clone().into(),

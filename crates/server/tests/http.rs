@@ -1,9 +1,11 @@
 use reqwest::{Client, StatusCode};
+use serde_json::{json, Value};
 use server::{config::Config, AppState};
 use std::sync::Arc;
 use tokio::{sync::oneshot, task::JoinHandle};
 use types::{
     Block, Column, ColumnData, ColumnDef, DataType, DbError, Peer, QueryEngine, QueryOutput,
+    TableSchema,
 };
 
 struct TestServer {
@@ -74,30 +76,212 @@ async fn sql(client: &Client, server: &TestServer, query: &str) -> String {
     body
 }
 
+fn coordinator_config(root: &std::path::Path, even: &TestServer, odd: &TestServer) -> Config {
+    Config {
+        data_dir: root.join("coordinator"),
+        sharding: [(
+            "hits".into(),
+            server::config::ShardedTableConfig {
+                local_table: "hits_local".into(),
+                key: "id".into(),
+                schema: None,
+                shards: [
+                    (10, odd.url.trim_start_matches("http://").into()),
+                    (2, even.url.trim_start_matches("http://").into()),
+                ]
+                .into(),
+                raft_shards: Default::default(),
+            },
+        )]
+        .into(),
+        ..Config::default()
+    }
+}
+
 async fn coordinator(root: &std::path::Path, even: &TestServer, odd: &TestServer) -> TestServer {
-    TestServer::start(
-        AppState::open(Config {
-            data_dir: root.join("coordinator"),
-            sharding: [(
-                "hits".into(),
-                server::config::ShardedTableConfig {
-                    local_table: "hits_local".into(),
-                    key: "id".into(),
-                    schema: None,
-                    shards: [
-                        (10, odd.url.trim_start_matches("http://").into()),
-                        (2, even.url.trim_start_matches("http://").into()),
-                    ]
-                    .into(),
-                    raft_shards: Default::default(),
-                },
-            )]
-            .into(),
-            ..Config::default()
-        })
-        .unwrap(),
-    )
-    .await
+    TestServer::start(AppState::open(coordinator_config(root, even, odd)).unwrap()).await
+}
+
+async fn table_metadata(
+    client: &Client,
+    server: &TestServer,
+    path: &str,
+    expected_status: StatusCode,
+) -> Value {
+    let response = client
+        .get(format!("{}{path}", server.url))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(status, expected_status, "{body}");
+    body
+}
+
+#[tokio::test]
+async fn coordinator_metadata_lists_logical_and_local_tables_and_sums_all_shards() {
+    for configured_schema in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let even = TestServer::start(state(&root.path().join("even"))).await;
+        let odd = TestServer::start(state(&root.path().join("odd"))).await;
+        let client = client();
+        for (shard, settings) in [
+            (&even, "id SETTINGS index_granularity = 1, codec = 'LZ4'"),
+            (&odd, "text SETTINGS index_granularity = 2, codec = 'ZSTD'"),
+        ] {
+            sql(
+                &client,
+                shard,
+                &format!(
+                    "CREATE TABLE hits_local (id UInt64, text String) ENGINE = MergeTree ORDER BY {settings}"
+                ),
+            )
+            .await;
+        }
+        let columns = json!([
+            {"name": "id", "data_type": "UInt64"},
+            {"name": "text", "data_type": "String"}
+        ]);
+        let mut config = coordinator_config(root.path(), &even, &odd);
+        if configured_schema {
+            config.sharding.get_mut("hits").unwrap().schema = Some(TableSchema {
+                columns: serde_json::from_value(columns.clone()).unwrap(),
+            });
+        }
+        let coordinator = TestServer::start(AppState::open(config).unwrap()).await;
+        sql(
+            &client,
+            &coordinator,
+            "CREATE TABLE local_hits (id UInt64) ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 17, codec = 'LZ4'",
+        )
+        .await;
+        client
+            .post(format!("{}/insert/hits", coordinator.url))
+            .body("1,one\n2,two\n3,three\n4,four\n5,five\n")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+
+        let logical =
+            json!({"name": "hits", "engine": "Distributed", "schema": {"columns": columns}});
+        let local = json!({
+            "name": "local_hits",
+            "engine": "MergeTree",
+            "schema": {"columns": [{"name": "id", "data_type": "UInt64"}]},
+            "order_by": ["id"],
+            "settings": {"index_granularity": 17, "codec": "LZ4"},
+        });
+        let listed = json!([logical, local]);
+        assert_eq!(
+            table_metadata(&client, &coordinator, "/tables", StatusCode::OK).await,
+            listed
+        );
+        let mut description =
+            table_metadata(&client, &coordinator, "/tables/hits", StatusCode::OK).await;
+        let stats = description
+            .as_object_mut()
+            .unwrap()
+            .remove("stats")
+            .unwrap();
+        assert_eq!(description, logical);
+        assert_eq!(
+            stats,
+            json!({
+                "parts_total": 2, "parts_selected": 2,
+                "granules_total": 4, "granules_selected": 4,
+                "rows_total": 5, "rows_selected": 5,
+            })
+        );
+        let count = sql(&client, &coordinator, "SELECT count() FROM hits").await;
+        assert_eq!(
+            count.trim().parse::<u64>().unwrap(),
+            stats["rows_total"].as_u64().unwrap()
+        );
+
+        odd.close().await;
+        assert_eq!(
+            table_metadata(&client, &coordinator, "/tables", StatusCode::OK).await,
+            listed
+        );
+        let error = table_metadata(
+            &client,
+            &coordinator,
+            "/tables/hits",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        assert!(
+            error["error"].as_str().unwrap().contains("shard 10"),
+            "{error}"
+        );
+        assert!(error.get("stats").is_none(), "{error}");
+
+        even.close().await;
+        if configured_schema {
+            assert_eq!(
+                table_metadata(&client, &coordinator, "/tables", StatusCode::OK).await,
+                listed
+            );
+        } else {
+            let error = table_metadata(
+                &client,
+                &coordinator,
+                "/tables",
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+            .await;
+            assert!(
+                error["error"].as_str().unwrap().contains("shard 2"),
+                "{error}"
+            );
+        }
+        let mut description =
+            table_metadata(&client, &coordinator, "/tables/local_hits", StatusCode::OK).await;
+        assert_eq!(
+            description
+                .as_object_mut()
+                .unwrap()
+                .remove("stats")
+                .unwrap()["rows_total"],
+            0
+        );
+        assert_eq!(description, local);
+    }
+}
+
+#[tokio::test]
+async fn coordinator_reserves_logical_names_and_rejects_local_name_conflicts_on_startup() {
+    let root = tempfile::tempdir().unwrap();
+    let even = TestServer::start(state(&root.path().join("even"))).await;
+    let odd = TestServer::start(state(&root.path().join("odd"))).await;
+    let config = coordinator_config(root.path(), &even, &odd);
+    let coordinator = TestServer::start(AppState::open(config.clone()).unwrap()).await;
+    let client = client();
+    let ddl = "CREATE TABLE hits (id UInt64) ENGINE = MergeTree ORDER BY id";
+    let response = client
+        .post(format!("{}/query", coordinator.url))
+        .body(ddl)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(response
+        .text()
+        .await
+        .unwrap()
+        .contains("DDL for sharded tables"));
+    coordinator.close().await;
+
+    let standalone = TestServer::start(state(&config.data_dir)).await;
+    sql(&client, &standalone, ddl).await;
+    standalone.close().await;
+    assert!(
+        matches!(AppState::open(config), Err(DbError::Syntax(message))
+            if message.contains("\"hits\"") && message.contains("existing local table"))
+    );
 }
 
 #[tokio::test]
