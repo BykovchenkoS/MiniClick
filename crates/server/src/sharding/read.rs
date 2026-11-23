@@ -165,32 +165,46 @@ impl ShardedTable {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        // Для связывания WHERE нужна одна схема. Остальные шарды разрешаются по мере чтения.
-        let mut first_error = None;
-        let mut definition = None;
-        for shard in &mut endpoints {
-            match shard.entry(&client, config) {
-                Ok(entry) => {
-                    shard.table = Some(entry.id);
-                    definition = Some(entry.definition);
-                    break;
-                }
-                Err(error) => {
-                    first_error.get_or_insert(error);
-                }
-            }
-        }
-        let mut definition = definition.ok_or_else(|| {
-            first_error
-                .unwrap_or_else(|| DbError::Internal("sharded table has no destinations".into()))
-        })?;
-        name.clone_into(&mut definition.name);
+        let definition = match &config.schema {
+            Some(schema) => TableDefinition {
+                name: name.into(),
+                schema: schema.clone(),
+                engine: Engine::MergeTree,
+                order_by: Vec::new(),
+                settings: Default::default(),
+            },
+            None => Self::discover_definition(name, config, &client, &mut endpoints)?,
+        };
         Ok(Self {
             definition,
             endpoints,
             config: config.clone(),
             client,
         })
+    }
+
+    /// Конфигурации без явной схемы получают её с доступного шарда.
+    fn discover_definition(
+        name: &str,
+        config: &ShardedTableConfig,
+        client: &Client,
+        endpoints: &mut [Shard],
+    ) -> Result<TableDefinition> {
+        let mut first_error = None;
+        for shard in endpoints {
+            match shard.entry(client, config) {
+                Ok(mut entry) => {
+                    shard.table = Some(entry.id);
+                    name.clone_into(&mut entry.definition.name);
+                    return Ok(entry.definition);
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        Err(first_error
+            .unwrap_or_else(|| DbError::Internal("sharded table has no destinations".into())))
     }
 
     fn selected_shards(&self, predicate: Option<&Predicate>) -> Vec<Shard> {
@@ -246,15 +260,13 @@ impl Table for ShardedTable {
             .collect::<Result<Vec<_>>>()?;
         let request = ReadRequest::from(request);
         let client = self.client.clone();
-        let config = self.config.clone();
-        let schema = self.definition.schema.clone();
+        // Проверяем доступность всех нужных шардов до чтения, в том числе при LIMIT.
         let mut endpoints = self
             .selected_shards(request.predicate.as_ref())
             .into_iter()
-            .map({
-                let client = client.clone();
-                move |shard| shard.resolve(&client, &config, &schema)
-            });
+            .map(|shard| shard.resolve(&client, &self.config, &self.definition.schema))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter();
         let mut active = None;
         let mut done = false;
         Ok(Box::new(std::iter::from_fn(move || {
@@ -316,7 +328,7 @@ type ScanLines = Lines<BufReader<reqwest::blocking::Response>>;
 
 fn next_block(
     client: &Client,
-    endpoints: &mut impl Iterator<Item = Result<Shard>>,
+    endpoints: &mut impl Iterator<Item = Shard>,
     active: &mut Option<(u64, ScanLines)>,
     request: &ReadRequest,
     header: &[ColumnDef],
@@ -326,7 +338,6 @@ fn next_block(
             let Some(shard) = endpoints.next() else {
                 return Ok(None);
             };
-            let shard = shard?;
             let response = ShardedTable::request(client, &shard, "scan", request)?;
             *active = Some((shard.id, BufReader::new(response).lines()));
         }

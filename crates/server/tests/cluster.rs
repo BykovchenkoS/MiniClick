@@ -401,6 +401,26 @@ async fn coordinator_uses_independent_raft_groups_when_each_shard_elects_a_new_l
         even.sql(even_second, query).await,
         "2\teven-before\n4\teven-after\n6\twith-odd-down\n"
     );
+    assert_eq!(
+        even.sql(coordinator, "SELECT value FROM hits WHERE id = 6")
+            .await,
+        "with-odd-down\n"
+    );
+    for sql in [query, "SELECT value FROM hits LIMIT 1"] {
+        let response = even
+            .client
+            .post(even.url(coordinator, "/query"))
+            .body(sql)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body: Value = response.json().await.unwrap();
+        assert!(
+            body["error"].as_str().unwrap().contains("shard 2"),
+            "{body}"
+        );
+    }
     odd.restart(odd_first).await;
     // Сетевой ping возвращается раньше, чем новый лидер подтвердит чтение кворумом.
     even.await_query(
@@ -411,6 +431,21 @@ async fn coordinator_uses_independent_raft_groups_when_each_shard_elects_a_new_l
     .await;
     odd.await_rows(odd_first, "1\todd-before\n3\todd-after\n")
         .await;
+
+    even.kill(even_second);
+    even.kill(coordinator);
+    even.restart(coordinator).await;
+    assert_eq!(
+        even.sql(coordinator, "SELECT value FROM hits WHERE id = 3")
+            .await,
+        "odd-after\n"
+    );
+    odd.kill(odd_first);
+    assert_eq!(
+        even.sql(coordinator, "SELECT value FROM hits LIMIT 0")
+            .await,
+        ""
+    );
 }
 
 #[tokio::test]
