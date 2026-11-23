@@ -43,8 +43,8 @@ impl ToSchema for BinaryBody {}
     (status = 400, description = "Ошибочные данные, формат или ключ чужого шарда", body = ErrorResponse),
     (status = 404, description = "Таблица не найдена", body = ErrorResponse),
     (status = 409, description = "Запись на реплику", body = ErrorResponse),
-    (status = 413, description = "Превышен лимит тела", body = ErrorResponse),
-    (status = 502, description = "Ошибка связи с шардом, записи или проверки его схемы", body = ErrorResponse),
+    (status = 413, description = "Превышен лимит тела. При записи на несколько шардов часть уже могла подтвердить запись", body = ErrorResponse),
+    (status = 502, description = "Ошибка проверки шарда или записи. После начала отправки результат может быть частичным или неизвестным", body = ErrorResponse),
     (status = 500, description = "Ошибка сервера", body = ErrorResponse)
 ))]
 pub async fn insert(

@@ -340,11 +340,8 @@ async fn coordinator_uses_independent_raft_groups_when_each_shard_elects_a_new_l
     odd.sql(odd_first, ddl).await;
 
     assert_eq!(
-        even.insert(coordinator, "1,odd-before\n").await,
-        StatusCode::OK
-    );
-    assert_eq!(
-        even.insert(coordinator, "2,even-before\n").await,
+        even.insert(coordinator, "1,odd-before\n2,even-before\n")
+            .await,
         StatusCode::OK
     );
     let even_term = even.status(even_first).await["term"].clone();
@@ -394,8 +391,9 @@ async fn coordinator_uses_independent_raft_groups_when_each_shard_elects_a_new_l
         StatusCode::BAD_GATEWAY
     );
     assert_eq!(
-        even.insert(coordinator, "8,allowed\n9,mixed\n").await,
-        StatusCode::BAD_REQUEST
+        even.insert(coordinator, "8,mixed-even\n9,mixed-odd\n")
+            .await,
+        StatusCode::BAD_GATEWAY
     );
     assert_eq!(
         even.sql(even_second, query).await,

@@ -1,11 +1,11 @@
-//! Маршрутизация одной атомарной вставки на физический шард.
+//! Распределение INSERT по физическим шардам с атомарностью на каждом шарде.
 
 pub(crate) mod read;
 
 use crate::{
     config::{RaftShardConfig, ShardedTableConfig},
     error::{blocking, ApiError},
-    formats::{parse_input, InputFormat},
+    formats::{format_insert_tsv, parse_input, InputFormat},
     insert::{insert_block, InsertParams},
     AppState,
 };
@@ -39,43 +39,68 @@ pub(crate) async fn insert(
     format: InputFormat,
     body: Bytes,
 ) -> Result<(), ApiError> {
-    let target = if let Some(schema) = &table.schema {
-        match insert_shard(table, schema, format, &body).await? {
-            Some(id) => {
-                let (url, entry) = load_shard(client, table, id).await?;
-                Some((id, url, entry))
-            }
-            None => None,
-        }
-    } else {
-        legacy_insert_target(client, table, format, &body).await?
-    };
-    let Some((id, url, entry)) = target else {
+    if body.is_empty() {
         return Ok(());
-    };
-    let response = client
-        .post(table_url(url, "insert", &entry.id)?)
-        .query(&[("format", format)])
-        .body(body)
-        .send()
-        .await
-        .map_err(|error| shard_error(id, format!("INSERT outcome unknown: {error}")))?;
-    match response.status() {
-        StatusCode::OK => Ok(()),
-        StatusCode::PAYLOAD_TOO_LARGE => Err(ApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!("shard {id} rejected the INSERT body size"),
-        )),
-        status => Err(shard_error(id, format!("INSERT returned {status}"))),
     }
+    let mut entries = if table.schema.is_some() {
+        BTreeMap::new()
+    } else {
+        legacy_insert_entries(client, table).await?
+    };
+    let schema = table
+        .schema
+        .as_ref()
+        .or_else(|| {
+            entries
+                .values()
+                .next()
+                .map(|(_, entry)| &entry.definition.schema)
+        })
+        .ok_or_else(|| DbError::Internal("sharded table has no destinations".into()))?;
+    let (format, batches) = split_insert(table, schema, format, body).await?;
+    let mut requests = Vec::with_capacity(batches.len());
+    for (id, body) in batches {
+        let (url, entry) = match entries.remove(&id) {
+            Some(entry) => entry,
+            None => load_shard(client, table, id).await?,
+        };
+        let url = table_url(url, "insert", &entry.id).map_err(|error| shard_error(id, error))?;
+        requests.push((id, client.post(url).query(&[("format", format)]).body(body)));
+    }
+
+    let mut confirmed = Vec::with_capacity(requests.len());
+    for (id, request) in requests {
+        let outcome = match request.send().await {
+            Ok(response) if response.status() == StatusCode::OK => {
+                confirmed.push(id);
+                continue;
+            }
+            Ok(response) if response.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+                let message = format!("shard {id} rejected the INSERT body size");
+                return Err(ApiError::new(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    if confirmed.is_empty() {
+                        message
+                    } else {
+                        format!("{message}; partial INSERT, confirmed shards: {confirmed:?}")
+                    },
+                ));
+            }
+            Ok(response) => format!("HTTP {}", response.status()),
+            Err(error) => error.to_string(),
+        };
+        return Err(shard_error(
+            id,
+            format!("INSERT outcome unknown ({outcome}); confirmed shards: {confirmed:?}"),
+        ));
+    }
+    Ok(())
 }
 
-async fn legacy_insert_target(
+async fn legacy_insert_entries(
     client: &Client,
     table: &ShardedTableConfig,
-    format: InputFormat,
-    body: &Bytes,
-) -> Result<Option<(u64, Url, TableEntry)>, ApiError> {
+) -> Result<BTreeMap<u64, (Url, TableEntry)>, ApiError> {
     let mut entries = BTreeMap::new();
     for &id in table.shards.keys() {
         entries.insert(id, load_shard(client, table, id).await?);
@@ -92,13 +117,7 @@ async fn legacy_insert_target(
         }
     }
 
-    let Some(id) = insert_shard(table, &first.definition.schema, format, body).await? else {
-        return Ok(None);
-    };
-    let (url, entry) = entries
-        .remove(&id)
-        .ok_or_else(|| DbError::Internal("destination shard metadata is missing".into()))?;
-    Ok(Some((id, url, entry)))
+    Ok(entries)
 }
 
 async fn load_shard(
@@ -141,39 +160,40 @@ async fn load_shard(
     Ok((base, entry))
 }
 
-async fn insert_shard(
+async fn split_insert(
     table: &ShardedTableConfig,
     schema: &TableSchema,
     format: InputFormat,
-    body: &Bytes,
-) -> Result<Option<u64>, ApiError> {
+    body: Bytes,
+) -> Result<(InputFormat, Vec<(u64, Bytes)>), ApiError> {
     let schema = schema.clone();
     let table = table.clone();
-    let input = body.clone();
     blocking(move || {
-        let block = parse_input(format, &input, &schema)?;
+        let block = parse_input(format, &body, &schema)?;
         let Some(ColumnData::UInt64(keys)) = block.column(&table.key) else {
             return Err(DbError::Internal(
                 "validated sharding key is missing".into(),
             ));
         };
-        let Some(first) = keys.first() else {
-            return Ok(None);
-        };
-        let (id, _) = table
-            .shard_for_key(*first)
-            .ok_or_else(|| DbError::Internal("sharded table has no destinations".into()))?;
-        let first_index = table.shard_index(*first);
-        if keys
-            .iter()
-            .skip(1)
-            .any(|&key| table.shard_index(key) != first_index)
-        {
-            return Err(DbError::Unsupported(
-                "INSERT must target a single shard".into(),
-            ));
+        let shard_ids: Vec<_> = table.shards.keys().copied().collect();
+        let mut rows_by_shard = BTreeMap::<u64, Vec<usize>>::new();
+        for (row, &key) in keys.iter().enumerate() {
+            let index = table
+                .shard_index(key)
+                .ok_or_else(|| DbError::Internal("sharded table has no destinations".into()))?;
+            rows_by_shard.entry(shard_ids[index]).or_default().push(row);
         }
-        Ok(Some(id))
+        if let Some((&id, _)) = rows_by_shard
+            .first_key_value()
+            .filter(|(_, rows)| rows.len() == block.rows())
+        {
+            return Ok((format, vec![(id, body)]));
+        }
+        let batches = rows_by_shard
+            .into_iter()
+            .map(|(id, rows)| (id, Bytes::from(format_insert_tsv(&block.take(&rows)))))
+            .collect();
+        Ok((InputFormat::Tsv, batches))
     })
     .await
 }
@@ -308,7 +328,7 @@ pub(crate) async fn insert_local(
         return Ok("Ok.\n");
     }
     blocking(move || {
-        // ID связывает запись со схемой, прочитанной координатором до разбора тела.
+        // ID связывает запись с физической таблицей, схему которой сверил координатор.
         let table = app.catalog.get_table_by_id(&TableId::new(id))?;
         if table.definition().engine != Engine::MergeTree {
             return Err(DbError::Unsupported(

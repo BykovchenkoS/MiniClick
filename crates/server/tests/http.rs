@@ -13,11 +13,14 @@ struct TestServer {
 }
 impl TestServer {
     async fn start(state: AppState) -> Self {
+        Self::start_router(server::router(state)).await
+    }
+    async fn start_router(router: axum::Router) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (stop, stopped) = oneshot::channel();
         let task = tokio::spawn(async move {
-            axum::serve(listener, server::router(state))
+            axum::serve(listener, router)
                 .with_graceful_shutdown(async {
                     let _ = stopped.await;
                 })
@@ -126,10 +129,19 @@ async fn sharded_http_insert_routes_whole_batches_and_rejects_invalid_input_atom
     }
     let coordinator = coordinator(root.path(), &even, &odd).await;
     for (format, input) in [
-        ("CSV", "4,four\n2,two\n"),
-        ("TSV", "1\tone\n"),
-        ("JSONEachRow", "{\"text\":\"three\",\"id\":3}\n"),
+        (
+            "CSV",
+            "1,\"кавычки \"\"да\"\",\r\nещё строка\"\r\n2,two\r\n7,seven\r\n0,zero\r\n",
+        ),
+        ("TSV", "4\tfour\\\\with\\ttab\n3\tthree\\nстроки\n"),
+        (
+            "JSONEachRow",
+            "{\"text\":\"пять\",\"id\":5}\n{\"id\":6,\"text\":\"six\\u0000\"}\n",
+        ),
+        ("CSV", "10,ten\n8,eight\n"),
         ("CSV", ""),
+        ("TSV", ""),
+        ("JSONEachRow", ""),
     ] {
         let response = client
             .post(format!("{}/insert/hits?format={format}", coordinator.url))
@@ -144,22 +156,20 @@ async fn sharded_http_insert_routes_whole_batches_and_rejects_invalid_input_atom
             response.text().await.unwrap()
         );
     }
-    for (input, error) in [
-        ("6,six\n7,seven\n", "single shard"),
-        ("6,six\ninvalid,broken\n", "row 2"),
-    ] {
-        let response = client
-            .post(format!("{}/insert/hits", coordinator.url))
-            .body(input)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(response.text().await.unwrap().contains(error));
-    }
+    let response = client
+        .post(format!("{}/insert/hits", coordinator.url))
+        .body("12,twelve\n13,thirteen\ninvalid,broken\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(response.text().await.unwrap().contains("row 3"));
+
     let select = "SELECT id, text FROM hits_local ORDER BY id";
-    assert_eq!(sql(&client, &even, select).await, "2\ttwo\n4\tfour\n");
-    assert_eq!(sql(&client, &odd, select).await, "1\tone\n3\tthree\n");
+    let even_rows = "0\tzero\n2\ttwo\n4\tfour\\\\with\\ttab\n6\tsix\\0\n8\teight\n10\tten\n";
+    let odd_rows = "1\tкавычки \"да\",\\r\\nещё строка\n3\tthree\\nстроки\n5\tпять\n7\tseven\n";
+    assert_eq!(sql(&client, &even, select).await, even_rows);
+    assert_eq!(sql(&client, &odd, select).await, odd_rows);
 
     let entry = even_state.catalog.table_entries().pop().unwrap();
     for path in [
@@ -168,7 +178,7 @@ async fn sharded_http_insert_routes_whole_batches_and_rejects_invalid_input_atom
     ] {
         let response = client
             .post(format!("{}{path}", even.url))
-            .body("8,eight\n9,nine\n")
+            .body("12,twelve\n9,nine\n")
             .send()
             .await
             .unwrap();
@@ -178,19 +188,19 @@ async fn sharded_http_insert_routes_whole_batches_and_rejects_invalid_input_atom
             error.contains("row 2") && error.contains("id=9") && error.contains("shard 2"),
             "{error}"
         );
-        assert_eq!(sql(&client, &even, select).await, "2\ttwo\n4\tfour\n");
-        assert_eq!(sql(&client, &odd, select).await, "1\tone\n3\tthree\n");
+        assert_eq!(sql(&client, &even, select).await, even_rows);
+        assert_eq!(sql(&client, &odd, select).await, odd_rows);
     }
     let direct = client
         .post(format!("{}/insert/hits_local", even.url))
-        .body("8,eight\n")
+        .body("12,twelve\n")
         .send()
         .await
         .unwrap();
     assert_eq!(direct.status(), StatusCode::OK);
     assert_eq!(
-        sql(&client, &coordinator, "SELECT text FROM hits WHERE id = 8").await,
-        "eight\n"
+        sql(&client, &coordinator, "SELECT text FROM hits WHERE id = 12").await,
+        "twelve\n"
     );
 
     sql(&client, &odd, "DROP TABLE hits_local").await;
@@ -202,7 +212,7 @@ async fn sharded_http_insert_routes_whole_batches_and_rejects_invalid_input_atom
     .await;
     let response = client
         .post(format!("{}/insert/hits", coordinator.url))
-        .body("8,eight\n")
+        .body("14,fourteen\n15,fifteen\n")
         .send()
         .await
         .unwrap();
@@ -210,8 +220,87 @@ async fn sharded_http_insert_routes_whole_batches_and_rejects_invalid_input_atom
     assert!(response.text().await.unwrap().contains("schema differs"));
     assert_eq!(
         sql(&client, &even, select).await,
-        "2\ttwo\n4\tfour\n8\teight\n"
+        format!("{even_rows}12\ttwelve\n")
     );
+    assert_eq!(sql(&client, &odd, select).await, "");
+}
+
+#[tokio::test]
+async fn sharded_insert_reports_confirmed_and_unknown_outcomes_without_retrying() {
+    use axum::{extract::Request, middleware, response::IntoResponse};
+
+    let root = tempfile::tempdir().unwrap();
+    let even = TestServer::start(state(&root.path().join("even"))).await;
+    let odd = TestServer::start_router(server::router(state(&root.path().join("odd"))).layer(
+        middleware::from_fn(|request: Request, next: middleware::Next| async move {
+            let insert = request.uri().path().starts_with("/shard/insert/");
+            let response = next.run(request).await;
+            if insert && response.status() == StatusCode::OK {
+                // Запись уже применена, но координатор не получает подтверждение.
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            response
+        }),
+    ))
+    .await;
+    let client = client();
+    let ddl = "CREATE TABLE hits_local (id UInt64, text String) ENGINE = MergeTree ORDER BY id";
+    for shard in [&even, &odd] {
+        sql(&client, shard, ddl).await;
+    }
+    let coordinator = coordinator(root.path(), &even, &odd).await;
+    let response = client
+        .post(format!("{}/insert/hits", coordinator.url))
+        .body("1,odd\n2,even\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let error = response.text().await.unwrap();
+    assert!(
+        error.contains("shard 10: INSERT outcome unknown"),
+        "{error}"
+    );
+    assert!(error.contains("confirmed shards: [2]"), "{error}");
+    let select = "SELECT id, text FROM hits_local ORDER BY id";
+    assert_eq!(sql(&client, &even, select).await, "2\teven\n");
+    assert_eq!(sql(&client, &odd, select).await, "1\todd\n");
+}
+
+#[tokio::test]
+async fn sharded_insert_reports_partial_write_when_a_shard_rejects_the_body_size() {
+    let root = tempfile::tempdir().unwrap();
+    let even = TestServer::start(state(&root.path().join("even"))).await;
+    let odd = TestServer::start(
+        AppState::open(Config {
+            data_dir: root.path().join("odd"),
+            max_body_bytes: 256,
+            ..Config::default()
+        })
+        .unwrap(),
+    )
+    .await;
+    let client = client();
+    let ddl = "CREATE TABLE hits_local (id UInt64, text String) ENGINE = MergeTree ORDER BY id";
+    for shard in [&even, &odd] {
+        sql(&client, shard, ddl).await;
+    }
+    let coordinator = coordinator(root.path(), &even, &odd).await;
+    let response = client
+        .post(format!("{}/insert/hits", coordinator.url))
+        .body(format!("2,even\n1,odd\n3,{}\n", "x".repeat(256)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let error = response.text().await.unwrap();
+    assert!(error.contains("shard 10 rejected"), "{error}");
+    assert!(
+        error.contains("partial INSERT, confirmed shards: [2]"),
+        "{error}"
+    );
+    let select = "SELECT id, text FROM hits_local ORDER BY id";
+    assert_eq!(sql(&client, &even, select).await, "2\teven\n");
     assert_eq!(sql(&client, &odd, select).await, "");
 }
 

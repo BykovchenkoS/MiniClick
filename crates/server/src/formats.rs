@@ -205,6 +205,32 @@ fn escape(text: &str) -> String {
     output
 }
 
+fn write_tsv(output: &mut Vec<u8>, block: &Block, field_text: impl Fn(Value) -> String) {
+    for row in 0..block.rows() {
+        for (index, column) in block.columns().iter().enumerate() {
+            if index > 0 {
+                output.push(b'\t');
+            }
+            let text = field_text(column.data.get(row));
+            output.extend_from_slice(escape(&text).as_bytes());
+        }
+        output.push(b'\n');
+    }
+}
+
+/// Кодирует типизированный блок для повторного разбора через parse_input на шарде.
+pub(crate) fn format_insert_tsv(block: &Block) -> Vec<u8> {
+    let mut output = Vec::new();
+    write_tsv(&mut output, block, |value| match value {
+        // Display теряет знак NaN и разворачивает экспоненту у конечных чисел.
+        Value::Float64(number) if number.is_nan() && number.is_sign_negative() => "-NaN".into(),
+        Value::Float64(number) => format!("{number:e}"),
+        Value::String(text) => text,
+        other => other.to_string(),
+    });
+    output
+}
+
 fn json_value(value: Value) -> serde_json::Value {
     match value {
         Value::Int64(number) => number.into(),
@@ -247,15 +273,7 @@ pub fn format_output(
                 writer.flush()?;
             }
             OutputFormat::Tsv => {
-                for row in 0..block.rows() {
-                    let fields: Vec<_> = block
-                        .columns()
-                        .iter()
-                        .map(|column| escape(&column.data.get(row).to_string()))
-                        .collect();
-                    output.extend_from_slice(fields.join("\t").as_bytes());
-                    output.push(b'\n');
-                }
+                write_tsv(&mut output, &block, |value| value.to_string());
             }
             OutputFormat::JsonEachRow => {
                 for row in 0..block.rows() {
@@ -320,4 +338,49 @@ pub fn format_output(
         }
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use types::ColumnData;
+
+    #[test]
+    fn insert_tsv_preserves_temporal_values_and_float_bits() {
+        let schema = TableSchema {
+            columns: [
+                ("id", DataType::UInt64),
+                ("amount", DataType::Int64),
+                ("ratio", DataType::Float64),
+                ("day", DataType::Date),
+                ("time", DataType::DateTime),
+            ]
+            .into_iter()
+            .map(|(name, data_type)| ColumnDef {
+                name: name.into(),
+                data_type,
+            })
+            .collect(),
+        };
+        let block = parse_input(
+            InputFormat::Csv,
+            b"18446744073709551615,-9223372036854775808,5e-324,1969-12-31,1969-12-31T23:59:59\n\
+              2,0,-0,2024-02-29,2024-02-29\n\
+              4,1,-NaN,0000-01-01,0000-01-01\n",
+            &schema,
+        )
+        .unwrap();
+        let encoded = format_insert_tsv(&block);
+        let decoded = parse_input(InputFormat::Tsv, &encoded, &schema).unwrap();
+        assert_eq!(block.header(), decoded.header());
+        for (original, decoded) in block.columns().iter().zip(decoded.columns()) {
+            match (&original.data, &decoded.data) {
+                (ColumnData::Float64(original), ColumnData::Float64(decoded)) => assert!(original
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .eq(decoded.iter().map(|value| value.to_bits()))),
+                (original, decoded) => assert_eq!(original, decoded),
+            }
+        }
+    }
 }
