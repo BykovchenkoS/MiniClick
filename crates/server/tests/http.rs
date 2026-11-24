@@ -63,6 +63,24 @@ fn state(root: &std::path::Path) -> AppState {
     })
     .unwrap()
 }
+fn shard_config(root: &std::path::Path, shard_id: u64) -> Config {
+    Config {
+        data_dir: root.to_owned(),
+        local_shards: [(
+            "hits_local".into(),
+            server::config::LocalShardConfig {
+                key: "id".into(),
+                shard_id,
+                shard_ids: vec![10, 2],
+            },
+        )]
+        .into(),
+        ..Config::default()
+    }
+}
+fn shard_state(root: &std::path::Path, shard_id: u64) -> AppState {
+    AppState::open(shard_config(root, shard_id)).unwrap()
+}
 async fn sql(client: &Client, server: &TestServer, query: &str) -> String {
     let response = client
         .post(format!("{}/query", server.url))
@@ -123,8 +141,8 @@ async fn table_metadata(
 async fn coordinator_metadata_lists_logical_and_local_tables_and_sums_all_shards() {
     for configured_schema in [false, true] {
         let root = tempfile::tempdir().unwrap();
-        let even = TestServer::start(state(&root.path().join("even"))).await;
-        let odd = TestServer::start(state(&root.path().join("odd"))).await;
+        let even = TestServer::start(shard_state(&root.path().join("even"), 2)).await;
+        let odd = TestServer::start(shard_state(&root.path().join("odd"), 10)).await;
         let client = client();
         for (shard, settings) in [
             (&even, "id SETTINGS index_granularity = 1, codec = 'LZ4'"),
@@ -257,7 +275,7 @@ async fn coordinator_reserves_logical_names_and_rejects_local_name_conflicts_on_
     let root = tempfile::tempdir().unwrap();
     let even = TestServer::start(state(&root.path().join("even"))).await;
     let odd = TestServer::start(state(&root.path().join("odd"))).await;
-    let config = coordinator_config(root.path(), &even, &odd);
+    let mut config = coordinator_config(root.path(), &even, &odd);
     let coordinator = TestServer::start(AppState::open(config.clone()).unwrap()).await;
     let client = client();
     let ddl = "CREATE TABLE hits (id UInt64) ENGINE = MergeTree ORDER BY id";
@@ -275,6 +293,7 @@ async fn coordinator_reserves_logical_names_and_rejects_local_name_conflicts_on_
         .contains("DDL for sharded tables"));
     coordinator.close().await;
 
+    config.data_dir = root.path().join("existing-local-tables");
     let standalone = TestServer::start(state(&config.data_dir)).await;
     sql(&client, &standalone, ddl).await;
     standalone.close().await;
@@ -287,25 +306,9 @@ async fn coordinator_reserves_logical_names_and_rejects_local_name_conflicts_on_
 #[tokio::test]
 async fn sharded_http_insert_routes_whole_batches_and_rejects_invalid_input_atomically() {
     let root = tempfile::tempdir().unwrap();
-    let shard_state = |name, shard_id| {
-        AppState::open(Config {
-            data_dir: root.path().join(name),
-            local_shards: [(
-                "hits_local".into(),
-                server::config::LocalShardConfig {
-                    key: "id".into(),
-                    shard_id,
-                    shard_ids: vec![10, 2],
-                },
-            )]
-            .into(),
-            ..Config::default()
-        })
-        .unwrap()
-    };
-    let even_state = shard_state("even", 2);
+    let even_state = shard_state(&root.path().join("even"), 2);
     let even = TestServer::start(even_state.clone()).await;
-    let odd = TestServer::start(shard_state("odd", 10)).await;
+    let odd = TestServer::start(shard_state(&root.path().join("odd"), 10)).await;
     let client = client();
     let ddl = "CREATE TABLE hits_local (id UInt64, text String) ENGINE = MergeTree ORDER BY id";
     for shard in [&even, &odd] {
@@ -410,22 +413,165 @@ async fn sharded_http_insert_routes_whole_batches_and_rejects_invalid_input_atom
 }
 
 #[tokio::test]
+async fn restarting_with_changed_sharding_topology_leaves_existing_rows_intact() {
+    let root = tempfile::tempdir().unwrap();
+    let even_config = shard_config(&root.path().join("even"), 2);
+    let even = TestServer::start(AppState::open(even_config.clone()).unwrap()).await;
+    let odd = TestServer::start(shard_state(&root.path().join("odd"), 10)).await;
+    let config = coordinator_config(root.path(), &even, &odd);
+    let coordinator = TestServer::start(AppState::open(config.clone()).unwrap()).await;
+    let client = client();
+    let ddl = "CREATE TABLE hits_local (id UInt64) ENGINE = MergeTree ORDER BY id";
+    for shard in [&even, &odd] {
+        sql(&client, shard, ddl).await;
+    }
+    client
+        .post(format!("{}/insert/hits", coordinator.url))
+        .body("3\n4\n")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    coordinator.close().await;
+
+    let mut changed = config.clone();
+    changed
+        .sharding
+        .get_mut("hits")
+        .unwrap()
+        .shards
+        .insert(20, "new-shard:8123".into());
+    assert!(
+        matches!(AppState::open(changed), Err(DbError::Syntax(message))
+        if message.contains("sharding topology differs"))
+    );
+
+    let mut changed = config.clone();
+    let addresses = &mut changed.sharding.get_mut("hits").unwrap().shards;
+    let first = addresses[&2].clone();
+    let second = addresses[&10].clone();
+    addresses.insert(2, second);
+    addresses.insert(10, first);
+    assert!(
+        matches!(AppState::open(changed), Err(DbError::Syntax(message))
+        if message.contains("sharding topology differs"))
+    );
+
+    let coordinator = TestServer::start(AppState::open(config).unwrap()).await;
+    assert_eq!(
+        sql(&client, &coordinator, "SELECT id FROM hits WHERE id = 4").await,
+        "4\n"
+    );
+    assert_eq!(
+        sql(&client, &coordinator, "SELECT id FROM hits ORDER BY id").await,
+        "3\n4\n"
+    );
+    even.close().await;
+
+    let mut changed = even_config.clone();
+    changed
+        .local_shards
+        .get_mut("hits_local")
+        .unwrap()
+        .shard_ids
+        .push(20);
+    assert!(
+        matches!(AppState::open(changed), Err(DbError::Syntax(message))
+        if message.contains("sharding topology differs"))
+    );
+    let mut reordered = even_config;
+    reordered
+        .local_shards
+        .get_mut("hits_local")
+        .unwrap()
+        .shard_ids
+        .reverse();
+    let even = TestServer::start(AppState::open(reordered).unwrap()).await;
+    assert_eq!(
+        sql(&client, &even, "SELECT id FROM hits_local").await,
+        "4\n"
+    );
+    assert_eq!(sql(&client, &odd, "SELECT id FROM hits_local").await, "3\n");
+}
+
+#[tokio::test]
+async fn coordinator_rejects_incompatible_physical_placement_before_reading_or_writing() {
+    let root = tempfile::tempdir().unwrap();
+    let even = TestServer::start(shard_state(&root.path().join("even"), 2)).await;
+    let mut odd_config = shard_config(&root.path().join("odd"), 10);
+    // Индекс нечётного шарда совпадает, но состав шардов отличается.
+    odd_config
+        .local_shards
+        .get_mut("hits_local")
+        .unwrap()
+        .shard_ids = vec![3, 10];
+    let odd = TestServer::start(AppState::open(odd_config).unwrap()).await;
+    let client = client();
+    for shard in [&even, &odd] {
+        sql(
+            &client,
+            shard,
+            "CREATE TABLE hits_local (id UInt64) ENGINE = MergeTree ORDER BY id",
+        )
+        .await;
+    }
+    let mut config = coordinator_config(root.path(), &even, &odd);
+    config.sharding.get_mut("hits").unwrap().schema = Some(TableSchema {
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            data_type: DataType::UInt64,
+        }],
+    });
+    let coordinator = TestServer::start(AppState::open(config).unwrap()).await;
+    for (path, body, status) in [
+        (
+            "/query",
+            "SELECT id FROM hits WHERE id = 3",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+        ("/insert/hits", "4\n3\n", StatusCode::BAD_GATEWAY),
+    ] {
+        let response = client
+            .post(format!("{}{path}", coordinator.url))
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        let error = response.text().await.unwrap();
+        assert!(
+            error.contains("shard 10") && error.contains("shard placement mismatch"),
+            "{error}"
+        );
+    }
+    for shard in [&even, &odd] {
+        assert_eq!(
+            sql(&client, shard, "SELECT count() FROM hits_local").await,
+            "0\n"
+        );
+    }
+}
+
+#[tokio::test]
 async fn sharded_insert_reports_confirmed_and_unknown_outcomes_without_retrying() {
     use axum::{extract::Request, middleware, response::IntoResponse};
 
     let root = tempfile::tempdir().unwrap();
-    let even = TestServer::start(state(&root.path().join("even"))).await;
-    let odd = TestServer::start_router(server::router(state(&root.path().join("odd"))).layer(
-        middleware::from_fn(|request: Request, next: middleware::Next| async move {
-            let insert = request.uri().path().starts_with("/shard/insert/");
-            let response = next.run(request).await;
-            if insert && response.status() == StatusCode::OK {
-                // Запись уже применена, но координатор не получает подтверждение.
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-            response
-        }),
-    ))
+    let even = TestServer::start(shard_state(&root.path().join("even"), 2)).await;
+    let odd = TestServer::start_router(
+        server::router(shard_state(&root.path().join("odd"), 10)).layer(middleware::from_fn(
+            |request: Request, next: middleware::Next| async move {
+                let insert = request.uri().path().starts_with("/shard/insert/");
+                let response = next.run(request).await;
+                if insert && response.status() == StatusCode::OK {
+                    // Запись уже применена, но координатор не получает подтверждение.
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+                response
+            },
+        )),
+    )
     .await;
     let client = client();
     let ddl = "CREATE TABLE hits_local (id UInt64, text String) ENGINE = MergeTree ORDER BY id";
@@ -454,12 +600,11 @@ async fn sharded_insert_reports_confirmed_and_unknown_outcomes_without_retrying(
 #[tokio::test]
 async fn sharded_insert_reports_partial_write_when_a_shard_rejects_the_body_size() {
     let root = tempfile::tempdir().unwrap();
-    let even = TestServer::start(state(&root.path().join("even"))).await;
+    let even = TestServer::start(shard_state(&root.path().join("even"), 2)).await;
     let odd = TestServer::start(
         AppState::open(Config {
-            data_dir: root.path().join("odd"),
             max_body_bytes: 256,
-            ..Config::default()
+            ..shard_config(&root.path().join("odd"), 10)
         })
         .unwrap(),
     )
@@ -491,9 +636,9 @@ async fn sharded_insert_reports_partial_write_when_a_shard_rejects_the_body_size
 #[tokio::test]
 async fn sharded_select_groups_and_sorts_globally_and_fails_on_a_late_shard_error() {
     let root = tempfile::tempdir().unwrap();
-    let even = TestServer::start(state(&root.path().join("even"))).await;
+    let even = TestServer::start(shard_state(&root.path().join("even"), 2)).await;
     let odd_root = root.path().join("odd");
-    let odd_state = state(&odd_root);
+    let odd_state = shard_state(&odd_root, 10);
     let odd = TestServer::start(odd_state.clone()).await;
     let coordinator = coordinator(root.path(), &even, &odd).await;
     let client = client();
@@ -574,13 +719,12 @@ async fn sharded_select_skips_unneeded_shards_and_damaged_granules() {
     let root = tempfile::tempdir().unwrap();
     let even_root = root.path().join("even");
     let even_state = AppState::open(Config {
-        data_dir: even_root.clone(),
         max_body_bytes: 160,
-        ..Config::default()
+        ..shard_config(&even_root, 2)
     })
     .unwrap();
     let even = TestServer::start(even_state.clone()).await;
-    let odd = TestServer::start(state(&root.path().join("odd"))).await;
+    let odd = TestServer::start(shard_state(&root.path().join("odd"), 10)).await;
     let coordinator = coordinator(root.path(), &even, &odd).await;
     let client = client();
     for shard in [&even, &odd] {

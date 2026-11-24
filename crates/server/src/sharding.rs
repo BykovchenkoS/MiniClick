@@ -1,9 +1,10 @@
 //! Распределение INSERT по физическим шардам с атомарностью на каждом шарде.
 
 pub(crate) mod read;
+pub(crate) mod topology;
 
 use crate::{
-    config::{RaftShardConfig, ShardedTableConfig},
+    config::{LocalShardConfig, RaftShardConfig, ShardedTableConfig},
     error::{blocking, ApiError},
     formats::{format_insert_tsv, parse_input, InputFormat},
     insert::{insert_block, InsertParams},
@@ -19,7 +20,7 @@ use axum::{
     Json,
 };
 use reqwest::{Client, Url};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, time::Duration};
 use types::{ColumnData, DataType, DbError, Engine, TableEntry, TableId, TableSchema};
 
@@ -140,7 +141,7 @@ async fn load_shard(
     };
     let metadata = client
         .get(
-            base.join(metadata_path(group.is_some()))
+            base.join("shard/tables")
                 .map_err(|error| shard_error(id, error))?,
         )
         .send()
@@ -153,10 +154,10 @@ async fn load_shard(
         ));
     }
     let tables = metadata
-        .json::<Vec<TableEntry>>()
+        .json::<Vec<ShardTableEntry>>()
         .await
         .map_err(|error| shard_error(id, error))?;
-    let entry = physical_entry(tables, table).map_err(|error| shard_error(id, error))?;
+    let entry = physical_entry(tables, table, id).map_err(|error| shard_error(id, error))?;
     Ok((base, entry))
 }
 
@@ -196,14 +197,6 @@ async fn split_insert(
         Ok((InputFormat::Tsv, batches))
     })
     .await
-}
-
-fn metadata_path(replicated: bool) -> &'static str {
-    if replicated {
-        "shard/tables"
-    } else {
-        "replica/tables"
-    }
 }
 
 #[derive(Deserialize)]
@@ -269,14 +262,40 @@ fn table_url(mut base: Url, operation: &str, id: &TableId) -> types::Result<Url>
     Ok(base)
 }
 
+#[derive(Deserialize, Serialize)]
+pub(crate) struct ShardTableEntry {
+    #[serde(flatten)]
+    entry: TableEntry,
+    placement: LocalShardConfig,
+}
+
 fn physical_entry(
-    tables: Vec<TableEntry>,
+    tables: Vec<ShardTableEntry>,
     table: &ShardedTableConfig,
+    shard_id: u64,
 ) -> types::Result<TableEntry> {
-    let entry = tables
+    let ShardTableEntry {
+        entry,
+        mut placement,
+    } = tables
         .into_iter()
-        .find(|entry| entry.definition.name == table.local_table)
-        .ok_or_else(|| DbError::UnknownTable(table.local_table.clone()))?;
+        .find(|metadata| metadata.entry.definition.name == table.local_table)
+        .ok_or_else(|| {
+            DbError::TypeMismatch(format!(
+                "physical table {:?} is missing or has no shard placement",
+                table.local_table
+            ))
+        })?;
+    placement.shard_ids.sort_unstable();
+    if placement.key != table.key
+        || placement.shard_id != shard_id
+        || !placement.shard_ids.iter().eq(table.shards.keys())
+    {
+        return Err(DbError::TypeMismatch(format!(
+            "shard placement mismatch for {:?}: expected key {:?}, shard ID {shard_id} and shard IDs {:?}; got {placement:?}",
+            table.local_table, table.key, table.shards.keys().collect::<Vec<_>>(),
+        )));
+    }
     if entry.definition.engine != Engine::MergeTree
         || entry
             .definition
@@ -341,7 +360,9 @@ pub(crate) async fn insert_local(
     Ok("Ok.\n")
 }
 
-pub(crate) async fn tables(State(app): State<AppState>) -> Result<Json<Vec<TableEntry>>, ApiError> {
+pub(crate) async fn tables(
+    State(app): State<AppState>,
+) -> Result<Json<Vec<ShardTableEntry>>, ApiError> {
     read_barrier(&app).await?;
     blocking(move || {
         let _view = app
@@ -353,7 +374,10 @@ pub(crate) async fn tables(State(app): State<AppState>) -> Result<Json<Vec<Table
             app.catalog
                 .table_entries()
                 .into_iter()
-                .filter(|entry| app.config.local_shards.contains_key(&entry.definition.name))
+                .filter_map(|entry| {
+                    let placement = app.config.local_shards.get(&entry.definition.name)?.clone();
+                    Some(ShardTableEntry { entry, placement })
+                })
                 .collect(),
         ))
     })

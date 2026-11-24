@@ -51,9 +51,24 @@ impl AppState {
             Some(sharding::client()?)
         };
         let (directory, lease) = if config.cluster.is_some() {
+            if config
+                .data_dir
+                .join(sharding::topology::FILE_NAME)
+                .try_exists()?
+            {
+                return Err(DbError::Syntax(
+                    "Raft cannot use a data directory with saved standalone sharding topology"
+                        .into(),
+                ));
+            }
             let (path, lease) = cluster::prepare_view(&config)?;
             (path, Some(lease))
         } else {
+            if config.data_dir.join(cluster::IDENTITY_FILE).try_exists()? {
+                return Err(DbError::Syntax(
+                    "Raft data directory requires cluster configuration".into(),
+                ));
+            }
             (config.data_dir.clone(), None)
         };
         let catalog: Arc<dyn Catalog> = Arc::new(DiskCatalog::open(
@@ -71,6 +86,9 @@ impl AppState {
                 config.sharding.clone(),
             )?)
         };
+        if config.cluster.is_none() {
+            sharding::topology::check(&config)?;
+        }
         let query = Arc::new(::query::SqlQueryEngine::new(query_catalog));
         Ok(Self {
             catalog,

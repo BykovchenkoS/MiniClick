@@ -1,5 +1,7 @@
 use clap::Parser;
 use server::config::{Cli, Config};
+use server::AppState;
+use types::DbError;
 
 fn cli(args: &[&str]) -> Cli {
     Cli::try_parse_from(std::iter::once("miniclick").chain(args.iter().copied())).unwrap()
@@ -175,6 +177,38 @@ fn sharding_routes_full_width_keys_by_numeric_shard_id() {
     assert_eq!(table.shard_for_key(1 << 32), Some((7, "[::1]:8123")));
     assert_eq!(table.shard_for_key(5), Some((10, "shard10:8123")));
     assert_eq!(table.shard_for_key(u64::MAX), Some((2, "shard2:8123")));
+}
+
+#[test]
+fn saved_coordinator_topology_rejects_changed_ids_keys_and_removed_routes() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("config.toml");
+    std::fs::write(&path, SHARDING_CONFIG).unwrap();
+    let config = Config::load(cli(&[]), root.path()).unwrap();
+    drop(AppState::open(config.clone()).unwrap());
+
+    std::fs::write(
+        &path,
+        "[sharding.Hits]\nlocal_table = 'hits_local'\nkey = 'user_id'\nshards = { '7' = '[::1]:8123', '2' = 'shard2:8123', '10' = 'shard10:8123' }",
+    )
+    .unwrap();
+    drop(AppState::open(Config::load(cli(&[]), root.path()).unwrap()).unwrap());
+    for changed in [
+        SHARDING_CONFIG.replace(r#""7" ="#, r#""8" ="#),
+        SHARDING_CONFIG.replace("user_id", "new_key"),
+        SHARDING_CONFIG.replace("hits_local", "other_table"),
+        String::new(),
+    ] {
+        std::fs::write(&path, &changed).unwrap();
+        assert!(
+            matches!(
+                AppState::open(Config::load(cli(&[]), root.path()).unwrap()),
+                Err(DbError::Syntax(message)) if message.contains("sharding topology differs")
+            ),
+            "{changed}"
+        );
+    }
+    drop(AppState::open(config).unwrap());
 }
 
 #[test]

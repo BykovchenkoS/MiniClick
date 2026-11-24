@@ -25,10 +25,8 @@ openraft.workspace = true
 futures-util.workspace = true
 uuid.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 
 [[bin]]
 name = "miniclick"
 path = "src/main.rs"
-
-[dev-dependencies]
-tempfile.workspace = true

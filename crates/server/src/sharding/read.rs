@@ -3,7 +3,7 @@
 mod wire;
 
 use super::{
-    metadata_path, no_leader, physical_entry, read_barrier, shard_url, table_url, MemberStatus,
+    no_leader, physical_entry, read_barrier, shard_url, table_url, MemberStatus, ShardTableEntry,
 };
 use crate::{
     config::{RaftShardConfig, ShardedTableConfig},
@@ -109,14 +109,14 @@ impl Shard {
         }
         let metadata = self
             .base
-            .join(metadata_path(group.is_some()))
+            .join("shard/tables")
             .map_err(|error| shard_error(self.id, error))?;
         let tables = client
             .get(metadata)
             .send()
-            .and_then(|response| response.error_for_status()?.json::<Vec<TableEntry>>())
+            .and_then(|response| response.error_for_status()?.json::<Vec<ShardTableEntry>>())
             .map_err(|error| shard_error(self.id, error))?;
-        physical_entry(tables, config).map_err(|error| shard_error(self.id, error))
+        physical_entry(tables, config, self.id).map_err(|error| shard_error(self.id, error))
     }
 
     fn resolve(

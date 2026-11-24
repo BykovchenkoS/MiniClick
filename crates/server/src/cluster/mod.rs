@@ -27,6 +27,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub(crate) const IDENTITY_FILE: &str = "cluster-identity.json";
+
 pub struct Cluster {
     pub raft: ClusterRaft,
     config: crate::config::ClusterConfig,
@@ -74,7 +76,7 @@ pub(crate) fn prepare_view(config: &Config) -> Result<(PathBuf, Arc<File>)> {
         config: config.cluster.clone(),
         placement: placement(config)?,
     };
-    let identity_path = config.data_dir.join("cluster-identity.json");
+    let identity_path = config.data_dir.join(IDENTITY_FILE);
     let view = config.data_dir.join("view");
     state_machine::StateMachine::validate_file(&config.data_dir.join("raft-state.json"))?;
     if identity_path.exists() {
