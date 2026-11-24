@@ -27,6 +27,15 @@ DDL = (
 )
 FULL_QUERY = "SELECT user_id, category, amount FROM hits ORDER BY user_id"
 INITIAL_ROWS = "1\tnews\t40\n2\tnews\t20\n3\tblog\t55\n4\tshop\t50\n5\tblog\t1\n6\tnews\t1000\n"
+HITS = {
+    "name": "hits",
+    "engine": "Distributed",
+    "schema": {"columns": [
+        {"name": "user_id", "data_type": "UInt64"},
+        {"name": "category", "data_type": "String"},
+        {"name": "amount", "data_type": "Int64"},
+    ]},
+}
 
 
 def expect(actual, expected, label):
@@ -94,15 +103,29 @@ def run_demo(compose, coordinator_failover):
     def insert(body):
         return request(route, "/insert/hits?format=CSV", body)
 
+    def check_metadata(rows):
+        code, body = request(route, "/tables")
+        expect(code, 200, "Список таблиц")
+        expect(json.loads(body), [HITS], "Логическая таблица в списке")
+        code, body = request(route, "/tables/hits")
+        expect(code, 200, "Описание логической таблицы")
+        description = json.loads(body)
+        stats = description.pop("stats")
+        expect(description, HITS, "Описание hits")
+        expect((stats["rows_total"], stats["rows_selected"]), (rows, rows), "Строки на обоих шардах")
+
     for group in (EVEN, ODD):
         expect(request(group[0], "/cluster/init", b""), (200, "Ok.\n"), "Инициализация Raft")
         elected = wait_for(lambda: leader(group), "избрание лидера")
         expect(request(elected, "/query", DDL), (200, "Ok.\n"), "Создание таблицы")
-    for suffix in ("even", "odd"):
-        data = (ROOT / "deploy" / f"sharding-{suffix}.csv").read_bytes()
-        expect(insert(data), (200, "Ok.\n"), f"Загрузка CSV {suffix}")
+    data = b"".join(
+        (ROOT / "deploy" / f"sharding-{suffix}.csv").read_bytes()
+        for suffix in ("even", "odd")
+    )
+    expect(insert(data), (200, "Ok.\n"), "Один смешанный CSV")
     expect(sql(FULL_QUERY), (200, INITIAL_ROWS), "Данные перед отказом")
-    print("Чистый стенд: загружены и проверены 6 строк.", flush=True)
+    check_metadata(6)
+    print("Один смешанный INSERT: проверены 6 строк и HTTP-метаданные hits.", flush=True)
 
     if coordinator_failover:
         verify_coordinator_failover(compose, request, leader)
@@ -127,9 +150,18 @@ def run_demo(compose, coordinator_failover):
         error = json.loads(body)
         if set(error) != {"error"} or "shard 2" not in error["error"]:
             raise AssertionError(f"Ожидалась ошибка нечётного шарда без строк: {body}")
+    code, body = request(route, "/tables/hits")
+    expect(code, 500, "Статистика без кворума нечётного шарда")
+    error = json.loads(body)
+    if set(error) != {"error"} or "shard 2" not in error["error"]:
+        raise AssertionError(f"Ожидалась ошибка нечётного шарда без статистики: {body}")
     expect(insert("8,shop,70\n"), (200, "Ok.\n"), "INSERT на чётный шард")
     code, body = insert("7,shop,71\n9,shop,90\n")
     expect(code, 502, "INSERT на нечётный шард")
+    if "shard 2" not in json.loads(body)["error"]:
+        raise AssertionError(f"Ожидалась ошибка нечётного шарда: {body}")
+    code, body = insert("10,shop,100\n11,shop,110\n")
+    expect(code, 502, "Смешанный INSERT без кворума нечётного шарда")
     if "shard 2" not in json.loads(body)["error"]:
         raise AssertionError(f"Ожидалась ошибка нечётного шарда: {body}")
     print("Без кворума: SELECT и INSERT на чётном шарде работают, запросы к нечётному отклонены.", flush=True)
@@ -141,7 +173,8 @@ def run_demo(compose, coordinator_failover):
     # Docker может назначить другой динамический порт после рестарта.
     ports[COORDINATOR] = published_port(COORDINATOR)
     wait_for(lambda: sql(FULL_QUERY) == expected, "чтение после рестарта координатора")
-    print("После восстановления и рестарта: 7 строк, включая подтверждённый ключ 8; ключей 7 и 9 нет.", flush=True)
+    check_metadata(7)
+    print("После восстановления и рестарта: проверены точный набор из 7 строк и метаданные.", flush=True)
 
 
 def verify_coordinator_failover(compose, request, leader):
@@ -167,8 +200,11 @@ def verify_coordinator_failover(compose, request, leader):
         lambda: proxy("/query", FULL_QUERY) == (200, INITIAL_ROWS, BACKUP),
         "SELECT через новых лидеров",
     )
-    insertion = "/insert/hits?format=CSV"
-    expect(proxy(insertion, "7,shop,70\n8,news,80\n"), (200, "Ok.\n", BACKUP), "INSERT через резервный")
+    expect(
+        proxy("/insert/hits?format=TSV", "7\tshop\t70\n8\tnews\t80\n"),
+        (200, "Ok.\n", BACKUP),
+        "Смешанный TSV через резервный",
+    )
     expected = INITIAL_ROWS + "7\tshop\t70\n8\tnews\t80\n"
     expect(proxy("/query", FULL_QUERY), (200, expected, BACKUP), "Запись видна через резервный")
     print("Основной остановлен: резервный обслуживает SELECT и INSERT через новых лидеров.", flush=True)
@@ -177,7 +213,15 @@ def verify_coordinator_failover(compose, request, leader):
     wait_for_coordinator(COORDINATOR)
     expect(proxy("/query", FULL_QUERY), (200, expected, COORDINATOR), "Основной видит запись резервного")
     compose("kill", BACKUP)
-    expect(proxy(insertion, "9,blog,90\n10,shop,100\n"), (200, "Ok.\n", COORDINATOR), "INSERT через основной")
+    json_rows = "".join(
+        json.dumps({"user_id": user_id, "category": category, "amount": amount}) + "\n"
+        for user_id, category, amount in ((9, "blog", 90), (10, "shop", 100))
+    )
+    expect(
+        proxy("/insert/hits?format=JSONEachRow", json_rows),
+        (200, "Ok.\n", COORDINATOR),
+        "Смешанный JSONEachRow через основной",
+    )
     expected += "9\tblog\t90\n10\tshop\t100\n"
     expect(proxy("/query", FULL_QUERY), (200, expected, COORDINATOR), "Точный набор строк после отказов")
     print("После возврата основного и остановки резервного проверены все 10 строк.", flush=True)

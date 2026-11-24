@@ -2,7 +2,7 @@ name: Rust
 on:
   pull_request:
   push:
-    branches: [main, feat/storage, 'integration/**']
+    branches: [main, feat/storage, feat/sharding, 'integration/**']
 
 jobs:
   check:
@@ -11,7 +11,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: '1.90.0'
+          toolchain: '1.89.0'
           components: rustfmt, clippy
       - name: Formatting
         run: cargo fmt --all -- --check

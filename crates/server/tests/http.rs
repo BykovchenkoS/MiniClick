@@ -410,6 +410,25 @@ async fn sharded_http_insert_routes_whole_batches_and_rejects_invalid_input_atom
         format!("{even_rows}12\ttwelve\n")
     );
     assert_eq!(sql(&client, &odd, select).await, "");
+    let response = client
+        .post(format!("{}/query", coordinator.url))
+        .body("SELECT id, text FROM hits ORDER BY id")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let error: Value = response.json().await.unwrap();
+    assert!(error["error"].as_str().unwrap().contains("schema differs"));
+    assert_eq!(error.as_object().unwrap().len(), 1);
+    let error = table_metadata(
+        &client,
+        &coordinator,
+        "/tables/hits",
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+    .await;
+    assert!(error["error"].as_str().unwrap().contains("schema differs"));
+    assert!(error.get("stats").is_none());
 }
 
 #[tokio::test]
@@ -671,6 +690,15 @@ async fn sharded_select_groups_and_sorts_globally_and_fails_on_a_late_shard_erro
         sql(
             &client,
             &coordinator,
+            "SELECT min(amount), max(amount) FROM hits WHERE id > 1"
+        )
+        .await,
+        "1\t1000\n"
+    );
+    assert_eq!(
+        sql(
+            &client,
+            &coordinator,
             "SELECT label FROM hits ORDER BY id DESC LIMIT 2"
         )
         .await,
@@ -753,6 +781,13 @@ async fn sharded_select_skips_unneeded_shards_and_damaged_granules() {
         .await,
         "3\n4\n"
     );
+    let plan = sql(
+        &client,
+        &coordinator,
+        "EXPLAIN SELECT id FROM hits WHERE id = 4 OR id + 0 = 3",
+    )
+    .await;
+    assert!(plan.lines().any(|line| line.trim() == "shards: [2, 10]"));
     assert_eq!(
         sql(
             &client,
