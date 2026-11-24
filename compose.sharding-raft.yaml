@@ -22,6 +22,27 @@ services:
       - ./deploy/sharding-raft-coordinator.toml:/app/node.toml:ro
       - coordinator-data:/data
 
+  coordinator-backup:
+    <<: *node
+    command: ["--config", "/app/node.toml", "--node-id", "coordinator-backup"]
+    ports:
+      - "127.0.0.1:${MINICLICK_RAFT_COORDINATOR_BACKUP_PORT:-8147}:8123"
+    volumes:
+      - ./deploy/sharding-raft-coordinator.toml:/app/node.toml:ro
+      - coordinator-backup-data:/data
+
+  coordinator-proxy:
+    image: haproxy:3.2-alpine
+    ports:
+      - "127.0.0.1:${MINICLICK_RAFT_PROXY_PORT:-8148}:8123"
+    volumes:
+      - ./deploy/sharding-raft-haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8123/ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
   shard-even-1:
     <<: *node
     ports:
@@ -72,6 +93,7 @@ services:
 
 volumes:
   coordinator-data:
+  coordinator-backup-data:
   shard-even-1-data:
   shard-even-2-data:
   shard-even-3-data:
