@@ -5,12 +5,17 @@ use crate::{
     formats::{parse_input, InputFormat},
     AppState,
 };
-use axum::body::Bytes;
 use axum::extract::{
     rejection::{BytesRejection, PathRejection, QueryRejection},
     Path, Query, State,
 };
+use axum::{
+    body::Bytes,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use types::{ColumnData, DbError, Engine, Table};
 use utoipa::{IntoParams, ToSchema};
 
@@ -21,6 +26,18 @@ pub struct InsertParams {
     #[serde(default)]
     #[param(default = "CSV", required = false)]
     pub format: InputFormat,
+    #[param(value_type = String, required = false)]
+    pub request_id: Option<String>,
+}
+
+impl InsertParams {
+    pub(crate) fn parsed_request_id(&self) -> Result<Option<uuid::Uuid>, ApiError> {
+        self.request_id
+            .as_deref()
+            .map(uuid::Uuid::parse_str)
+            .transpose()
+            .map_err(|error| DbError::Syntax(format!("invalid request_id: {error}")).into())
+    }
 }
 
 pub struct BinaryBody;
@@ -40,28 +57,36 @@ impl ToSchema for BinaryBody {}
     InsertParams, ("table" = String, Path, description = "Имя существующей таблицы")
 ), request_body(content = BinaryBody, content_type = "application/octet-stream", description = "Файл без заголовка; JSONEachRow — объекты с именами колонок"), responses(
     (status = 200, description = "Вставка завершена", body = String, content_type = "text/plain"),
+    (status = 202, description = "Распределённая вставка принята и ждёт завершения", body = String, content_type = "text/plain"),
     (status = 400, description = "Ошибочные данные, формат или ключ чужого шарда", body = ErrorResponse),
     (status = 404, description = "Таблица не найдена", body = ErrorResponse),
-    (status = 409, description = "Запись на реплику", body = ErrorResponse),
-    (status = 413, description = "Превышен лимит тела. При записи на несколько шардов часть уже могла подтвердить запись", body = ErrorResponse),
-    (status = 502, description = "Ошибка проверки шарда или записи. После начала отправки результат может быть частичным или неизвестным", body = ErrorResponse),
-    (status = 500, description = "Ошибка сервера", body = ErrorResponse)
+    (status = 409, description = "Запись на реплику или конфликт request_id", body = ErrorResponse),
+    (status = 413, description = "Превышен лимит тела", body = ErrorResponse),
+    (status = 502, description = "Сбой предварительной проверки шарда", body = ErrorResponse),
+    (status = 500, description = "Ошибка сервера", body = ErrorResponse),
+    (status = 503, description = "Ожидается завершение предыдущей распределённой вставки", body = ErrorResponse)
 ))]
 pub async fn insert(
     State(app): State<AppState>,
     path: Result<Path<String>, PathRejection>,
     params: Result<Query<InsertParams>, QueryRejection>,
     body: Result<Bytes, BytesRejection>,
-) -> Result<&'static str, ApiError> {
+) -> Result<Response, ApiError> {
     let Path(name) = path?;
     let Query(params) = params?;
+    let request_id = params.parsed_request_id()?;
     if let Some(table) = app.config.sharding.get(&name) {
-        let client = app
-            .shard_client
-            .as_ref()
-            .ok_or_else(|| DbError::Internal("shard HTTP client is missing".into()))?;
-        crate::sharding::insert(client, table, params.format, body?).await?;
-        return Ok("Ok.\n");
+        return match crate::sharding::insert(&app, &name, table, params.format, body?, request_id)
+            .await?
+        {
+            Some(id) => Ok((StatusCode::ACCEPTED, format!("Pending {id}\n")).into_response()),
+            None => Ok("Ok.\n".into_response()),
+        };
+    }
+    if request_id.is_some() {
+        return Err(
+            DbError::Unsupported("request_id requires a logical sharded table".into()).into(),
+        );
     }
     if let Some(cluster) = &app.cluster {
         cluster
@@ -71,7 +96,7 @@ pub async fn insert(
                 body: body?.to_vec(),
             })
             .await?;
-        return Ok("Ok.\n");
+        return Ok("Ok.\n".into_response());
     }
     app.check_writable()?;
     let body = body?;
@@ -80,7 +105,7 @@ pub async fn insert(
         insert_block(&app, table.as_ref(), params.format, &body)
     })
     .await?;
-    Ok("Ok.\n")
+    Ok("Ok.\n".into_response())
 }
 
 /// Проверяет размещение всех строк при записи как по имени, так и по ID.
@@ -89,6 +114,16 @@ pub(crate) fn insert_block(
     table: &dyn Table,
     format: InputFormat,
     body: &[u8],
+) -> types::Result<()> {
+    insert_block_with_id(app, table, format, body, None)
+}
+
+pub(crate) fn insert_block_with_id(
+    app: &AppState,
+    table: &dyn Table,
+    format: InputFormat,
+    body: &[u8],
+    request_id: Option<uuid::Uuid>,
 ) -> types::Result<()> {
     let definition = table.definition();
     let block = parse_input(format, body, &definition.schema)?;
@@ -117,5 +152,23 @@ pub(crate) fn insert_block(
             }
         }
     }
-    table.insert(block)
+    match request_id {
+        Some(id) => {
+            let checksum = insert_checksum(&definition.name, format, body);
+            table.insert_once(block, &id.to_string(), &checksum)
+        }
+        None => table.insert(block),
+    }
+}
+
+pub(crate) fn insert_checksum(table: &str, format: InputFormat, body: &[u8]) -> String {
+    let mut hash = Sha256::new();
+    hash.update((table.len() as u64).to_le_bytes());
+    hash.update(table.as_bytes());
+    hash.update([format as u8]);
+    hash.update(body);
+    hash.finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }

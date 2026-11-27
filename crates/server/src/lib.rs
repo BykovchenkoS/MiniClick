@@ -87,7 +87,8 @@ impl AppState {
             )?)
         };
         if config.cluster.is_none() {
-            sharding::topology::check(&config)?;
+            sharding::topology::check(&config, catalog.as_ref())?;
+            sharding::journal::initialize(&config)?;
         }
         let query = Arc::new(::query::SqlQueryEngine::new(query_catalog));
         Ok(Self {

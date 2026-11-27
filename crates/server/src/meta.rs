@@ -151,13 +151,19 @@ pub async fn tables(State(app): State<AppState>) -> Result<Json<Vec<TableInfo>>,
     (status = 200, description = "Описание и статистика полного скана, суммарная для всех шардов логической таблицы", body = TableDescription),
     (status = 400, description = "Неверное имя", body = ErrorResponse),
     (status = 404, description = "Таблица не найдена", body = ErrorResponse),
-    (status = 500, description = "Ошибка сервера или не удалось получить данные требуемого шарда", body = ErrorResponse)
+    (status = 500, description = "Ошибка сервера или не удалось получить данные требуемого шарда", body = ErrorResponse),
+    (status = 503, description = "Распределённая вставка ещё завершается", body = ErrorResponse)
 ))]
 pub async fn describe(
     State(app): State<AppState>,
     path: Result<Path<String>, PathRejection>,
 ) -> Result<Json<TableDescription>, ApiError> {
     let Path(name) = path?;
+    let _shard_view = if app.config.sharding.contains_key(&name) {
+        crate::sharding::journal::read_guard(&app).await?
+    } else {
+        None
+    };
     blocking(move || {
         let _view = app
             .view_gate

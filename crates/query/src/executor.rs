@@ -52,6 +52,7 @@ pub(crate) fn execute(plan: QueryPlan) -> Result<QueryOutput> {
             projection: plan.projection,
             predicate: plan.scan.predicate,
             remaining: plan.limit,
+            complete_scan: plan.table.requires_complete_scan(),
             done: false,
         }),
     })
@@ -62,6 +63,7 @@ struct SelectStream {
     projection: Vec<ProjectionColumn>,
     predicate: Option<Expr>,
     remaining: Option<u64>,
+    complete_scan: bool,
     done: bool,
 }
 
@@ -69,7 +71,18 @@ impl Iterator for SelectStream {
     type Item = Result<Block>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.done || self.remaining == Some(0) {
+        if self.done {
+            return None;
+        }
+        if self.remaining == Some(0) {
+            self.done = true;
+            if self.complete_scan {
+                for item in self.input.by_ref() {
+                    if let Err(error) = item {
+                        return Some(Err(error));
+                    }
+                }
+            }
             return None;
         }
         let item = match self.input.next() {

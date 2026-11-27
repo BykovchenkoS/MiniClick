@@ -1,0 +1,1 @@
+OPTIMIZE TABLE manual_events

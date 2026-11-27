@@ -46,6 +46,7 @@ pub struct Cli {
 struct FileConfig {
     listen_addr: Option<String>,
     data_dir: Option<PathBuf>,
+    shard_journal_dir: Option<PathBuf>,
     node_id: Option<String>,
     cluster_id: Option<String>,
     role: Option<String>,
@@ -159,6 +160,8 @@ fn deserialize_id_map<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
 pub struct Config {
     pub node: NodeConfig,
     pub data_dir: PathBuf,
+    /// Общий устойчивый каталог решений для координаторов одной карты размещения.
+    pub shard_journal_dir: Option<PathBuf>,
     pub max_body_bytes: usize,
     pub cluster: Option<ClusterConfig>,
     /// Карта логических таблиц по регистрозависимым именам.
@@ -178,6 +181,7 @@ impl Default for Config {
                 sync_interval_ms: 1000,
             },
             data_dir: PathBuf::from("./data"),
+            shard_journal_dir: None,
             max_body_bytes: 256 * 1024 * 1024,
             cluster: None,
             sharding: BTreeMap::new(),
@@ -218,6 +222,14 @@ impl Config {
             return Err(DbError::Syntax("data_dir must not be empty".into()));
         }
         config.data_dir = working_dir.join(data_dir);
+        if let Some(path) = file.shard_journal_dir {
+            if path.as_os_str().is_empty() {
+                return Err(DbError::Syntax(
+                    "shard_journal_dir must not be empty".into(),
+                ));
+            }
+            config.shard_journal_dir = Some(working_dir.join(path));
+        }
         if let Some(limit) = cli.max_body_bytes.or(file.max_body_bytes) {
             config.max_body_bytes = limit;
         }

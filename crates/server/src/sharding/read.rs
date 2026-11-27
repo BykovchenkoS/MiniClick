@@ -116,7 +116,9 @@ impl Shard {
             .send()
             .and_then(|response| response.error_for_status()?.json::<Vec<ShardTableEntry>>())
             .map_err(|error| shard_error(self.id, error))?;
-        physical_entry(tables, config, self.id).map_err(|error| shard_error(self.id, error))
+        physical_entry(tables, config, self.id)
+            .map(|metadata| metadata.entry)
+            .map_err(|error| shard_error(self.id, error))
     }
 
     fn resolve(
@@ -255,6 +257,10 @@ impl ShardedTable {
 impl Table for ShardedTable {
     fn definition(&self) -> &TableDefinition {
         &self.definition
+    }
+
+    fn requires_complete_scan(&self) -> bool {
+        true
     }
 
     fn scan(&self, request: &ScanRequest) -> Result<BlockStream> {

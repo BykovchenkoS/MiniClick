@@ -1,0 +1,1 @@
+CREATE TABLE manual_events (event_date Date, id UInt64, event_time DateTime, category String, amount Int64, ratio Float64) ENGINE = MergeTree ORDER BY (event_date, id) SETTINGS index_granularity = 2, codec = 'LZ4'

@@ -432,6 +432,38 @@ async fn sharded_http_insert_routes_whole_batches_and_rejects_invalid_input_atom
 }
 
 #[tokio::test]
+async fn enabling_sharding_rejects_existing_rows_placed_on_the_wrong_shard() {
+    let root = tempfile::tempdir().unwrap();
+    let client = client();
+    let standalone = TestServer::start(state(root.path())).await;
+    sql(
+        &client,
+        &standalone,
+        "CREATE TABLE hits_local (id UInt64) ENGINE = MergeTree ORDER BY id",
+    )
+    .await;
+    let inserted = client
+        .post(format!("{}/insert/hits_local", standalone.url))
+        .body("1\n2\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(inserted.status(), StatusCode::OK);
+    standalone.close().await;
+
+    assert!(matches!(
+        AppState::open(shard_config(root.path(), 2)),
+        Err(DbError::Syntax(message)) if message.contains("key id=1")
+    ));
+    assert!(!root.path().join("sharding-topology.json").exists());
+    let reopened = TestServer::start(state(root.path())).await;
+    assert_eq!(
+        sql(&client, &reopened, "SELECT id FROM hits_local ORDER BY id").await,
+        "1\n2\n"
+    );
+}
+
+#[tokio::test]
 async fn restarting_with_changed_sharding_topology_leaves_existing_rows_intact() {
     let root = tempfile::tempdir().unwrap();
     let even_config = shard_config(&root.path().join("even"), 2);
@@ -573,51 +605,86 @@ async fn coordinator_rejects_incompatible_physical_placement_before_reading_or_w
 }
 
 #[tokio::test]
-async fn sharded_insert_reports_confirmed_and_unknown_outcomes_without_retrying() {
+async fn sharded_insert_recovers_on_another_coordinator_without_partial_reads_or_duplicates() {
     use axum::{extract::Request, middleware, response::IntoResponse};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     let root = tempfile::tempdir().unwrap();
     let even = TestServer::start(shard_state(&root.path().join("even"), 2)).await;
+    let lose_response = Arc::new(AtomicBool::new(true));
+    let proxy_fault = lose_response.clone();
     let odd = TestServer::start_router(
         server::router(shard_state(&root.path().join("odd"), 10)).layer(middleware::from_fn(
-            |request: Request, next: middleware::Next| async move {
-                let insert = request.uri().path().starts_with("/shard/insert/");
-                let response = next.run(request).await;
-                if insert && response.status() == StatusCode::OK {
-                    // Запись уже применена, но координатор не получает подтверждение.
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            move |request: Request, next: middleware::Next| {
+                let lose_response = proxy_fault.clone();
+                async move {
+                    let insert = request.uri().path().starts_with("/shard/insert/");
+                    let response = next.run(request).await;
+                    if insert
+                        && response.status() == StatusCode::OK
+                        && lose_response.load(Ordering::Acquire)
+                    {
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                    response
                 }
-                response
             },
         )),
     )
     .await;
+
     let client = client();
     let ddl = "CREATE TABLE hits_local (id UInt64, text String) ENGINE = MergeTree ORDER BY id";
     for shard in [&even, &odd] {
         sql(&client, shard, ddl).await;
     }
     let coordinator = coordinator(root.path(), &even, &odd).await;
-    let response = client
-        .post(format!("{}/insert/hits", coordinator.url))
-        .body("1,odd\n2,even\n")
+    let mut backup_config = coordinator_config(root.path(), &even, &odd);
+    backup_config.shard_journal_dir = Some(backup_config.data_dir.join("shard-journal"));
+    backup_config.data_dir = root.path().join("backup");
+
+    let id = "24783a1f-38af-4e41-a045-e8d41ce1069a";
+    let input = "1,odd\n2,even\n";
+    let pending = client
+        .post(format!("{}/insert/hits?request_id={id}", coordinator.url))
+        .body(input)
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    let error = response.text().await.unwrap();
-    assert!(
-        error.contains("shard 10: INSERT outcome unknown"),
-        "{error}"
+    assert_eq!(pending.status(), StatusCode::ACCEPTED);
+    assert_eq!(pending.text().await.unwrap(), format!("Pending {id}\n"));
+    let reply = client
+        .post(format!("{}/query", coordinator.url))
+        .body("SELECT id FROM hits ORDER BY id")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), StatusCode::SERVICE_UNAVAILABLE);
+    coordinator.close().await;
+
+    lose_response.store(false, Ordering::Release);
+    let backup = TestServer::start(AppState::open(backup_config).unwrap()).await;
+    assert_eq!(
+        sql(&client, &backup, "SELECT id, text FROM hits ORDER BY id").await,
+        "1\todd\n2\teven\n"
     );
-    assert!(error.contains("confirmed shards: [2]"), "{error}");
-    let select = "SELECT id, text FROM hits_local ORDER BY id";
-    assert_eq!(sql(&client, &even, select).await, "2\teven\n");
-    assert_eq!(sql(&client, &odd, select).await, "1\todd\n");
+    for (body, status) in [(input, StatusCode::OK), ("3,other\n", StatusCode::CONFLICT)] {
+        let reply = client
+            .post(format!("{}/insert/hits?request_id={id}", backup.url))
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reply.status(), status);
+    }
+    assert_eq!(
+        sql(&client, &backup, "SELECT id, text FROM hits ORDER BY id").await,
+        "1\todd\n2\teven\n"
+    );
 }
 
 #[tokio::test]
-async fn sharded_insert_reports_partial_write_when_a_shard_rejects_the_body_size() {
+async fn sharded_insert_checks_all_batch_sizes_before_writing() {
     let root = tempfile::tempdir().unwrap();
     let even = TestServer::start(shard_state(&root.path().join("even"), 2)).await;
     let odd = TestServer::start(
@@ -643,12 +710,9 @@ async fn sharded_insert_reports_partial_write_when_a_shard_rejects_the_body_size
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     let error = response.text().await.unwrap();
     assert!(error.contains("shard 10 rejected"), "{error}");
-    assert!(
-        error.contains("partial INSERT, confirmed shards: [2]"),
-        "{error}"
-    );
+    assert!(error.contains("during preflight"), "{error}");
     let select = "SELECT id, text FROM hits_local ORDER BY id";
-    assert_eq!(sql(&client, &even, select).await, "2\teven\n");
+    assert_eq!(sql(&client, &even, select).await, "");
     assert_eq!(sql(&client, &odd, select).await, "");
 }
 
@@ -730,16 +794,18 @@ async fn sharded_select_groups_and_sorts_globally_and_fails_on_a_late_shard_erro
     let explain = sql(&client, &coordinator, &format!("EXPLAIN {grouped}")).await;
     assert!(explain.lines().any(|line| line.trim() == "shards: [2, 10]"));
     assert!(explain.contains("parts: 2 / 2, granules: 5 / 6, rows: 5 / 6"));
-    let response = client
-        .post(format!("{}/query", coordinator.url))
-        .body(grouped)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    let error = response.json::<serde_json::Value>().await.unwrap();
-    assert_eq!(error.as_object().unwrap().len(), 1);
-    assert!(error["error"].as_str().unwrap().contains("shard 10"));
+    for query in [grouped, "SELECT amount FROM hits LIMIT 1"] {
+        let response = client
+            .post(format!("{}/query", coordinator.url))
+            .body(query)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let error = response.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(error.as_object().unwrap().len(), 1);
+        assert!(error["error"].as_str().unwrap().contains("shard 10"));
+    }
 }
 
 #[tokio::test]

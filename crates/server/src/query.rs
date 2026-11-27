@@ -42,7 +42,8 @@ pub struct QueryParams {
         (status = 404, description = "Таблица не найдена", body = ErrorResponse),
         (status = 409, description = "Запись на реплику", body = ErrorResponse),
         (status = 413, description = "Превышен лимит тела", body = ErrorResponse),
-        (status = 500, description = "Ошибка сервера", body = ErrorResponse)
+        (status = 500, description = "Ошибка сервера", body = ErrorResponse),
+    (status = 503, description = "Распределённая вставка ещё завершается", body = ErrorResponse)
     )
 )]
 pub async fn query(
@@ -71,6 +72,7 @@ pub async fn query(
                 .into_response());
         }
     }
+    let _shard_view = crate::sharding::journal::read_guard(&app).await?;
     let (content_type, output) = blocking(move || {
         let _view = app
             .view_gate

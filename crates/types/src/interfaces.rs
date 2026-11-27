@@ -55,7 +55,38 @@ pub trait Table: Send + Sync {
     /// Проверку и приведение делает тот, кто зовёт (сервер при INSERT).
     fn insert(&self, block: Block) -> Result<()>;
 
+    /// Публикует блок и квитанцию одной операцией. Повтор с той же квитанцией безопасен.
+    fn insert_once(&self, _block: Block, _id: &str, _checksum: &str) -> Result<()> {
+        Err(DbError::Unsupported(
+            "table does not support idempotent inserts".into(),
+        ))
+    }
+
+    /// Квитанции вставок входят в контрольный снимок постоянной таблицы.
+    fn insert_receipts(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        Ok(Default::default())
+    }
+
+    /// Восстанавливает квитанции в ещё недоступной читателям таблице.
+    fn restore_insert_receipts(
+        &self,
+        receipts: std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        if receipts.is_empty() {
+            Ok(())
+        } else {
+            Err(DbError::Unsupported(
+                "table does not support insert receipts".into(),
+            ))
+        }
+    }
+
     fn scan(&self, request: &ScanRequest) -> Result<BlockStream>;
+
+    /// Требуется ли дочитать поток для проверки ошибок после достижения LIMIT.
+    fn requires_complete_scan(&self) -> bool {
+        false
+    }
 
     /// Что прочитал бы scan с этим запросом: только отсечение, данные не читаются.
     /// Должен использовать то же отсечение, что и scan, чтобы EXPLAIN не расходился

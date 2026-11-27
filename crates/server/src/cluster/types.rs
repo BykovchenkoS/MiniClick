@@ -16,6 +16,8 @@ pub enum Command {
         table: types::TableId,
         format: InputFormat,
         body: Vec<u8>,
+        #[serde(default)]
+        request_id: Option<String>,
     },
 }
 

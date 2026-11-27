@@ -28,6 +28,41 @@ impl MergeTreeTable {
             write_lock: Mutex::new(()),
         })
     }
+
+    fn insert_block(&self, block: Block, receipt: Option<(&str, &str)>) -> Result<()> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| internal("table write lock poisoned"))?;
+        self.repository.check_live()?;
+        validate_block(&block, &self.definition)?;
+        if let Some((id, checksum)) = receipt {
+            if self.repository.has_insert(id, checksum)? {
+                return Ok(());
+            }
+        }
+        if block.rows() == 0 {
+            return match receipt {
+                Some(_) => self.repository.publish(Vec::new(), &[], receipt),
+                None => Ok(()),
+            };
+        }
+        let id = self.repository.reserve_insert()?;
+        let result = (|| {
+            write_part(&self.repository.root, &id.name(), &self.definition, &block)?;
+            let part = self.repository.open_part(id)?;
+            self.repository.publish(vec![(id, part)], &[], receipt)
+        })();
+        if result.is_err() {
+            let path = self.repository.root.join(id.name());
+            if let Err(error) = fs::remove_dir_all(&path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(?path, %error, "Не удалось удалить неопубликованный part");
+                }
+            }
+        }
+        result
+    }
 }
 
 /// Фабрика MergeTree для регистрации в Catalog; data_dir уже задаёт каталог таблицы.
@@ -46,30 +81,26 @@ impl Table for MergeTreeTable {
     }
 
     fn insert(&self, block: Block) -> Result<()> {
+        self.insert_block(block, None)
+    }
+
+    fn insert_once(&self, block: Block, id: &str, checksum: &str) -> Result<()> {
+        self.insert_block(block, Some((id, checksum)))
+    }
+
+    fn insert_receipts(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        self.repository.insert_receipts()
+    }
+
+    fn restore_insert_receipts(
+        &self,
+        receipts: std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
         let _guard = self
             .write_lock
             .lock()
             .map_err(|_| internal("table write lock poisoned"))?;
-        self.repository.check_live()?;
-        validate_block(&block, &self.definition)?;
-        if block.rows() == 0 {
-            return Ok(());
-        }
-        let id = self.repository.reserve_insert()?;
-        let result = (|| {
-            write_part(&self.repository.root, &id.name(), &self.definition, &block)?;
-            let part = self.repository.open_part(id)?;
-            self.repository.replace(vec![(id, part)], &[])
-        })();
-        if result.is_err() {
-            let path = self.repository.root.join(id.name());
-            if let Err(error) = fs::remove_dir_all(&path) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(?path, %error, "Не удалось удалить неопубликованный part");
-                }
-            }
-        }
-        result
+        self.repository.restore_insert_receipts(receipts)
     }
 
     fn scan(&self, request: &ScanRequest) -> Result<BlockStream> {

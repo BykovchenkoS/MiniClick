@@ -2,7 +2,7 @@ name: miniclick-sharding
 
 x-node: &node
   image: miniclick:sharding-demo
-  build: .
+  pull_policy: never
   environment:
     RUST_LOG: info
   stop_grace_period: 15s
@@ -19,6 +19,7 @@ x-shard: &shard
 services:
   coordinator:
     <<: *node
+    build: .
     command: ["--config", "/app/coordinator.toml"]
     depends_on:
       shard-even:

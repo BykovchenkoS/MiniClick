@@ -2,7 +2,7 @@ name: miniclick-sharding-raft
 
 x-node: &node
   image: miniclick:sharding-raft-demo
-  build: .
+  pull_policy: never
   command: ["--config", "/app/node.toml"]
   environment:
     RUST_LOG: info,openraft=warn
@@ -16,11 +16,13 @@ x-node: &node
 services:
   coordinator:
     <<: *node
+    build: .
     ports:
       - "127.0.0.1:${MINICLICK_RAFT_COORDINATOR_PORT:-8140}:8123"
     volumes:
       - ./deploy/sharding-raft-coordinator.toml:/app/node.toml:ro
       - coordinator-data:/data
+      - coordinator-journal:/data/shard-journal
 
   coordinator-backup:
     <<: *node
@@ -30,6 +32,7 @@ services:
     volumes:
       - ./deploy/sharding-raft-coordinator.toml:/app/node.toml:ro
       - coordinator-backup-data:/data
+      - coordinator-journal:/data/shard-journal
 
   coordinator-proxy:
     image: haproxy:3.2-alpine
@@ -94,6 +97,7 @@ services:
 volumes:
   coordinator-data:
   coordinator-backup-data:
+  coordinator-journal:
   shard-even-1-data:
   shard-even-2-data:
   shard-even-3-data:

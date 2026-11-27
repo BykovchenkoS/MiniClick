@@ -8,7 +8,7 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /app /data \
+    && mkdir -p /app /data/shard-journal \
     && chown -R 10001:10001 /app /data
 WORKDIR /app
 COPY --from=builder /build/target/release/miniclick /usr/local/bin/miniclick

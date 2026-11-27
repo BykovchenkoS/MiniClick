@@ -69,6 +69,8 @@ struct Manifest {
     last_insert: u64,
     active: Vec<String>,
     definition: TableDefinition,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    insert_receipts: std::collections::BTreeMap<String, String>,
 }
 
 struct State {
@@ -113,6 +115,7 @@ impl PartRepository {
                 last_insert: 0,
                 active: Vec::new(),
                 definition: definition.clone(),
+                insert_receipts: Default::default(),
             }
         };
         if manifest.version != 1
@@ -228,6 +231,55 @@ impl PartRepository {
 
     /// Единственная точка публикации нового набора для INSERT и merge.
     pub fn replace(&self, add: Vec<(PartId, DataPart)>, remove: &[PartId]) -> Result<()> {
+        self.publish(add, remove, None)
+    }
+
+    pub fn insert_receipts(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        Ok(self
+            .state
+            .read()
+            .map_err(|_| internal("repository lock poisoned"))?
+            .manifest
+            .insert_receipts
+            .clone())
+    }
+
+    pub fn has_insert(&self, id: &str, checksum: &str) -> Result<bool> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| internal("repository lock poisoned"))?;
+        match state.manifest.insert_receipts.get(id) {
+            Some(existing) if existing != checksum => Err(types::DbError::Syntax(
+                "insert operation ID already used with different data".into(),
+            )),
+            Some(_) => Ok(true),
+            None => Ok(false),
+        }
+    }
+
+    pub fn restore_insert_receipts(
+        &self,
+        receipts: std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| internal("repository lock poisoned"))?;
+        self.check_live()?;
+        let mut manifest = state.manifest.clone();
+        manifest.insert_receipts = receipts;
+        persist(&self.root, &manifest)?;
+        state.manifest = manifest;
+        Ok(())
+    }
+
+    pub fn publish(
+        &self,
+        add: Vec<(PartId, DataPart)>,
+        remove: &[PartId],
+        receipt: Option<(&str, &str)>,
+    ) -> Result<()> {
         let mut state = self
             .state
             .write()
@@ -262,6 +314,11 @@ impl PartRepository {
             additions.push(Arc::new(part));
         }
         manifest.active.sort();
+        if let Some((id, checksum)) = receipt {
+            manifest
+                .insert_receipts
+                .insert(id.to_owned(), checksum.to_owned());
+        }
         persist(&self.root, &manifest)?;
         // После rename ошибок больше нет: память обязана соответствовать диску.
         state.parts.retain(|part| {

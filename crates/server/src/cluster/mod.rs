@@ -1,5 +1,6 @@
 //! Кластер с фиксированным составом: выборы и запись большинством через OpenRaft.
 
+mod checkpoint;
 mod log_store;
 mod network;
 mod state_machine;

@@ -1,16 +1,21 @@
-//! История применения — источник истины; каталог является восстанавливаемым представлением.
+//! Каталог восстанавливается из контрольного снимка и хвоста команд.
 
+use super::checkpoint::{self, TableCheckpoint};
 use super::log_store::{persist, read, storage_error};
 use super::types::{Command, CommandResult, Entry, TypeConfig};
-use crate::{insert::insert_block, AppState};
+use crate::{
+    insert::{insert_block, insert_block_with_id},
+    AppState,
+};
 use openraft::storage::RaftStateMachine;
 use openraft::{
     EntryPayload, LogId, RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError,
     StoredMembership,
 };
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::io::{self, Cursor};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{atomic::Ordering, Arc, Mutex};
 use types::DbError;
 
@@ -18,12 +23,18 @@ use types::DbError;
 struct Applied {
     last_applied: Option<LogId<u64>>,
     membership: StoredMembership<u64, openraft::BasicNode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     commands: Vec<Command>,
+    #[serde(default)]
+    command_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tables: Option<Vec<TableCheckpoint>>,
 }
 
 #[derive(Clone)]
 pub struct StateMachine {
     path: Arc<PathBuf>,
+    tail: Arc<PathBuf>,
     state: Arc<Mutex<Applied>>,
     app: AppState,
 }
@@ -50,6 +61,7 @@ fn execute(app: &AppState, command: &Command, ordinal: usize) -> types::Result<C
             table,
             format,
             body,
+            request_id,
         } => (|| {
             let table = app.catalog.get_table_by_id(table)?;
             if !app
@@ -61,7 +73,12 @@ fn execute(app: &AppState, command: &Command, ordinal: usize) -> types::Result<C
                     "Raft table has no shard placement".into(),
                 ));
             }
-            insert_block(app, table.as_ref(), *format, body)
+            let request_id = request_id
+                .as_deref()
+                .map(uuid::Uuid::parse_str)
+                .transpose()
+                .map_err(|error| DbError::Syntax(format!("invalid insert request ID: {error}")))?;
+            insert_block_with_id(app, table.as_ref(), *format, body, request_id)
         })(),
     };
     match result {
@@ -85,8 +102,73 @@ fn rebuild(app: &AppState, state: &Applied) -> types::Result<()> {
     for table in app.catalog.list_tables() {
         app.catalog.drop_table(&table.name, false)?;
     }
+    if let Some(tables) = &state.tables {
+        checkpoint::restore(app, tables)?;
+    }
     for (index, command) in state.commands.iter().enumerate() {
         execute(app, command, index + 1)?;
+    }
+    Ok(())
+}
+
+fn entry_files(tail: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
+    let mut entries = Vec::new();
+    for file in fs::read_dir(tail)? {
+        let path = file?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let index = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.parse::<u64>().ok())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid raft tail entry name")
+            })?;
+        entries.push((index, path));
+    }
+    entries.sort_unstable_by_key(|(index, _)| *index);
+    Ok(entries)
+}
+
+fn apply_entry(app: &AppState, state: &mut Applied, entry: Entry) -> types::Result<CommandResult> {
+    if let Some(last) = state.last_applied {
+        if last.index.checked_add(1) != Some(entry.log_id.index) {
+            return Err(DbError::Internal("nonconsecutive applied log index".into()));
+        }
+    }
+    let response = match entry.payload {
+        EntryPayload::Normal(command) => {
+            state.command_count = state
+                .command_count
+                .checked_add(1)
+                .ok_or_else(|| DbError::Internal("raft command ordinal overflow".into()))?;
+            execute(app, &command, state.command_count)?
+        }
+        EntryPayload::Membership(membership) => {
+            state.membership = StoredMembership::new(Some(entry.log_id), membership);
+            CommandResult {
+                error: None,
+                status: 200,
+            }
+        }
+        EntryPayload::Blank => CommandResult {
+            error: None,
+            status: 200,
+        },
+    };
+    state.last_applied = Some(entry.log_id);
+    Ok(response)
+}
+
+fn compact_tail(tail: &Path, last: Option<LogId<u64>>) -> io::Result<()> {
+    if let Some(last) = last {
+        for (_, path) in entry_files(tail)?
+            .into_iter()
+            .take_while(|(i, _)| *i <= last.index)
+        {
+            fs::remove_file(path)?;
+        }
     }
     Ok(())
 }
@@ -99,21 +181,59 @@ impl StateMachine {
 
     /// Вызывать до приёма HTTP-запросов и только после создания пустого view.
     pub fn open(path: PathBuf, app: AppState) -> types::Result<Self> {
-        let state: Applied = read(&path)?;
+        let mut state: Applied = read(&path)?;
+        let tail = path.with_extension("entries");
+        fs::create_dir_all(&tail)?;
+        if let Some(parent) = tail.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
         rebuild(&app, &state)?;
+        if !state.commands.is_empty() {
+            state.command_count = state.commands.len();
+        }
+        state.commands.clear();
+        state.tables = None;
+        let checkpoint_index = state.last_applied.map(|id| id.index);
+        for (index, file) in entry_files(&tail)? {
+            if checkpoint_index.is_some_and(|last| index <= last) {
+                continue;
+            }
+            let entry: Entry =
+                serde_json::from_reader(fs::File::open(file)?).map_err(io::Error::other)?;
+            if entry.log_id.index != index {
+                return Err(DbError::Internal("raft tail entry index mismatch".into()));
+            }
+            apply_entry(&app, &mut state, entry)?;
+        }
         Ok(Self {
             path: Arc::new(path),
+            tail: Arc::new(tail),
             state: Arc::new(Mutex::new(state)),
             app,
         })
     }
 
     fn snapshot(&self) -> io::Result<Snapshot<TypeConfig>> {
+        let _view = self
+            .app
+            .view_gate
+            .read()
+            .map_err(|error| io::Error::other(error.to_string()))?;
         let state = self
             .state
             .lock()
             .map_err(|error| io::Error::other(error.to_string()))?;
-        let data = serde_json::to_vec(&*state).map_err(io::Error::other)?;
+        let checkpoint = Applied {
+            tables: Some(checkpoint::capture(&self.app).map_err(io::Error::other)?),
+            ..state.clone()
+        };
+        persist(&self.path, &checkpoint)?;
+        compact_tail(&self.tail, state.last_applied)?;
+        Self::encode_snapshot(&checkpoint)
+    }
+
+    fn encode_snapshot(state: &Applied) -> io::Result<Snapshot<TypeConfig>> {
+        let data = serde_json::to_vec(state).map_err(io::Error::other)?;
         Ok(Snapshot {
             meta: SnapshotMeta {
                 last_log_id: state.last_applied,
@@ -176,35 +296,14 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
                 for entry in entries {
                     if state
                         .last_applied
-                        .is_some_and(|last| entry.log_id.index <= last.index)
+                        .is_some_and(|last| last.index.checked_add(1) != Some(entry.log_id.index))
                     {
-                        return Err(DbError::Internal(
-                            "applied log index is not increasing".into(),
-                        ));
+                        return Err(DbError::Internal("nonconsecutive applied log index".into()));
                     }
-                    let mut next = state.clone();
-                    next.last_applied = Some(entry.log_id);
-                    match &entry.payload {
-                        EntryPayload::Normal(command) => next.commands.push(command.clone()),
-                        EntryPayload::Membership(membership) => {
-                            next.membership =
-                                StoredMembership::new(Some(entry.log_id), membership.clone())
-                        }
-                        EntryPayload::Blank => {}
-                    }
-                    // История фиксируется раньше view: после сбоя view строится заново.
-                    persist(&this.path, &next)?;
-                    let response = match &entry.payload {
-                        EntryPayload::Normal(command) => {
-                            execute(&this.app, command, next.commands.len())?
-                        }
-                        _ => CommandResult {
-                            error: None,
-                            status: 200,
-                        },
-                    };
-                    *state = next;
-                    results.push(response);
+                    // Каждый новый индекс закрепляется до изменения восстанавливаемого view.
+                    let path = this.tail.join(format!("{}.json", entry.log_id.index));
+                    persist(&path, &entry)?;
+                    results.push(apply_entry(&this.app, &mut state, entry)?);
                 }
                 Ok::<_, DbError>(results)
             })();
@@ -254,9 +353,21 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
                     .state
                     .lock()
                     .map_err(|_| DbError::Internal("state lock poisoned".into()))?;
+                if state
+                    .last_applied
+                    .is_some_and(|last| next.last_applied.is_none_or(|id| id.index < last.index))
+                {
+                    return Err(DbError::Internal("snapshot predates applied index".into()));
+                }
                 persist(&this.path, &next)?;
                 rebuild(&this.app, &next)?;
-                *state = next;
+                compact_tail(&this.tail, next.last_applied)?;
+                *state = Applied {
+                    command_count: next.command_count.max(next.commands.len()),
+                    commands: Vec::new(),
+                    tables: None,
+                    ..next
+                };
                 Ok::<_, DbError>(())
             })();
             if result.is_err() {
@@ -275,8 +386,17 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<u64>> {
-        let snapshot = self.build_snapshot().await?;
-        Ok(snapshot.meta.last_log_id.map(|_| snapshot))
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let saved: Applied = read(&path)?;
+            if saved.last_applied.is_none() {
+                return Ok(None);
+            }
+            Self::encode_snapshot(&saved).map(Some)
+        })
+        .await
+        .map_err(storage_error)?
+        .map_err(storage_error)
     }
 }
 
@@ -354,10 +474,7 @@ mod tests {
             1
         );
         // Имитируем обратное окно: история устойчива, но view ещё не обновлён.
-        let mut durable = reopened.state.lock().unwrap().clone();
-        durable.commands.push(insert(b"3\n"));
-        durable.last_applied = Some(LogId::new(CommittedLeaderId::new(1, 1), 2));
-        persist(&reopened.path, &durable).unwrap();
+        persist(&reopened.tail.join("2.json"), &entry(2, insert(b"3\n"))).unwrap();
         StateMachine::open(reopened.path.as_ref().clone(), app.clone()).unwrap();
         assert_eq!(ids(&app), [1, 2, 3]);
     }
@@ -386,6 +503,14 @@ mod tests {
             .await
             .unwrap();
         let snapshot = machine.build_snapshot().await.unwrap();
+        assert!(entry_files(&machine.tail).unwrap().is_empty());
+        let saved: Applied = read(&machine.path).unwrap();
+        assert!(saved.commands.is_empty());
+        assert!(saved.tables.is_some());
+        machine.apply([entry(3, insert(b"11\n"))]).await.unwrap();
+        let source = machine.app.clone();
+        StateMachine::open(machine.path.as_ref().clone(), source.clone()).unwrap();
+        assert_eq!(ids(&source), [3, 7, 11]);
         let target_root = tempfile::tempdir().unwrap();
         let target = app(target_root.path());
         let path = target_root.path().join("state.json");
@@ -418,6 +543,55 @@ mod tests {
         assert_eq!(last.unwrap().index, 2);
         assert_eq!(membership, expected_membership);
         assert_eq!(ids(&target), [3, 7]);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_restores_table_identity_and_insert_receipts_after_merge() {
+        let root = tempfile::tempdir().unwrap();
+        let app = AppState::open(Config {
+            data_dir: root.path().join("view"),
+            local_shards: [(
+                "hits".into(),
+                crate::config::LocalShardConfig {
+                    key: "id".into(),
+                    shard_id: 1,
+                    shard_ids: vec![1, 2],
+                },
+            )]
+            .into(),
+            ..Config::default()
+        })
+        .unwrap();
+        let path = root.path().join("state.json");
+        let mut machine = StateMachine::open(path.clone(), app.clone()).unwrap();
+        let command = Command::ShardInsert {
+            table: types::TableId::new(uuid::Uuid::from_u128(1).to_string()),
+            format: InputFormat::Csv,
+            body: b"2\n".to_vec(),
+            request_id: Some(uuid::Uuid::from_u128(15).to_string()),
+        };
+        let responses = machine
+            .apply([
+                entry(
+                    0,
+                    Command::Sql(
+                        "CREATE TABLE hits (id UInt64) ENGINE = MergeTree ORDER BY id".into(),
+                    ),
+                ),
+                entry(1, command.clone()),
+                entry(2, insert(b"4\n")),
+                entry(3, Command::Sql("OPTIMIZE TABLE hits".into())),
+            ])
+            .await
+            .unwrap();
+        assert!(responses.iter().all(|response| response.status == 200));
+        machine.build_snapshot().await.unwrap();
+        drop(machine);
+
+        let mut machine = StateMachine::open(path, app.clone()).unwrap();
+        let response = machine.apply([entry(4, command)]).await.unwrap();
+        assert_eq!(response[0].status, 200);
+        assert_eq!(ids(&app), [2, 4]);
     }
 
     #[tokio::test]
@@ -459,7 +633,7 @@ mod tests {
             )])
             .await
             .unwrap();
-        std::fs::create_dir(path.with_extension("tmp")).unwrap();
+        std::fs::create_dir(machine.tail.join("1.tmp")).unwrap();
         assert!(machine.apply([entry(1, insert(b"1\n"))]).await.is_err());
         assert!(app.check_view().is_err());
     }
